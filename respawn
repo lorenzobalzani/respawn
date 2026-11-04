@@ -1031,11 +1031,11 @@ doctor() {
   say "Agents:"
   for agent in $AGENTS; do
     if ! agent_installed "$agent"; then
-      printf '  %-12s not installed\n' "$(agent_label "$agent")"
+      printf '  %-14s not installed\n' "$(agent_label "$agent")"
     elif agent_hooked "$agent"; then
-      printf '  %-12s hooks installed\n' "$(agent_label "$agent")"
+      printf '  %-14s hooks installed\n' "$(agent_label "$agent")"
     else
-      printf '  %-12s installed, no hooks: run respawn setup\n' "$(agent_label "$agent")"
+      printf '  %-14s installed, no hooks: run respawn setup\n' "$(agent_label "$agent")"
     fi
   done
   say "Terminal: $(terminal_label "$(detect_terminal)")"
