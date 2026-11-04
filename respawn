@@ -26,7 +26,7 @@
 
 set -u
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/respawn"
 RECORDS="$STATE_DIR/sessions"
 MAX_AGE_DAYS=7 # a session cut off longer ago than this is dropped rather than offered
