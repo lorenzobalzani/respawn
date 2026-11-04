@@ -25,5 +25,5 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install tmux, the one terminal that opens tabs without a screen
         run: |
-          if [ "$RUNNER_OS" = macOS ]; then brew install tmux; else sudo apt-get install -y tmux; fi
+          if [ "$RUNNER_OS" = macOS ]; then brew install tmux; else sudo apt-get update && sudo apt-get install -y tmux; fi
       - run: tests/test.sh
