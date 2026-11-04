@@ -113,8 +113,8 @@ control it. Say yes once.
 ## How it works
 
 Each agent's own hooks keep a small record of every interactive session: its id, its folder, the agent's
-process, and the shell that started it. A session is **cut off** when both the agent and its shell are gone: the
-terminal went away with them.
+process, and the tab's shell, the one the terminal started. A session is **cut off** when both the agent and that
+shell are gone: the terminal went away with them.
 
 ```mermaid
 flowchart LR
@@ -133,27 +133,47 @@ its shell; an agent whose terminal closed has already lost it. That was measured
 Claude Code in a real shell, a closed terminal left the agent reparented before its end hook ran, in every run,
 and `/exit` never did.
 
+An agent may take a while to exit after its session ends (MCP servers stopping), and a closing terminal's shell
+may outlive its agent for a moment (zsh saves its history first), so respawn waits for both: up to 30 seconds for
+the agent, then 2 seconds for the shell. It waits in the background, and the agent never waits for it.
+
 | The session ended because | respawn |
 | :- | :- |
 | The terminal quit, the Mac restarted, the window or tab closed, the terminal crashed | Offers it |
 | You quit the agent and kept using the tab | Forgets it |
-| You switched with `/clear` or `/resume` | Forgets it, and records the session you switched to |
+| You switched with `/clear`, `/resume` or Codex's `/new` | Forgets it, and records the session you switched to |
 | The agent unloaded it while idle (Codex does, after 30 minutes) | Keeps it: it's still open |
-| A headless run (`claude -p`, `codex exec`) or a background session | Never records it: no terminal |
+| A run with no terminal (cron, CI, an editor's background process) or a background session | Never records it |
 | A subagent or a teammate | Never records it |
-| It was cut off more than 7 days ago | Drops it |
+| Its last activity was more than 7 days ago | Drops it |
+
+A headless run in a terminal (`claude -p`, `codex exec`) is recorded like any session, and forgotten when it
+finishes in a tab that stays open.
 
 A few more details:
 
 - **"Gone" means gone.** A record keeps each process's start time as well as its id: after a reboot, ids are
-  reused, and a dead shell's zombie still answers `kill -0`.
+  reused, and a dead shell's zombie still answers `kill -0`. On Linux the start time is counted from boot, as the
+  kernel keeps it, so a clock that NTP steps doesn't make a running session look dead.
+- **The tab's shell, not whatever started the agent.** A launcher between the shell and the agent (npm's `node`
+  for Codex or OpenCode, `npx`, `caffeinate`, `mise exec`) exits with the agent, so respawn records the session
+  leader above the agent, which is the shell the terminal started.
 - **Codex runs its hooks in a background daemon**, away from your window. respawn finds the window by its folder
-  and its terminal instead.
+  and its terminal instead. A window runs one session at a time, so a new one there (`/new`, `/resume`) replaces
+  the old record.
 - **A hook belongs to its nearest agent.** Copilot CLI and Cursor CLI also run Claude Code's hooks; respawn
-  doesn't mistake their sessions for Claude's.
+  doesn't mistake their sessions for Claude's, not even when a Claude Code window is open in the same folder.
+- **Last activity.** For an agent that keeps a transcript respawn can see, its last write; for the others (Copilot
+  CLI, Kiro CLI, OpenCode), the last prompt you sent.
 - **Folders that moved.** If a session's folder is gone (a removed worktree, say), its tab opens in your home
   folder, and the agent finds the session by id.
-- **Cheap.** The prompt hook returns at once for a session it has already recorded.
+- **Cheap.** The start hook reads the process table once. The prompt hook, for a session already recorded,
+  only touches its record.
+
+**A limit, with Codex:** its hooks don't say which client a session belongs to. A session from Codex's own
+app-server (one an IDE or the Codex app runs for itself) is left out. But a client that shares the background
+daemon of Codex's terminal windows can't be told from them: its session, started in the folder of a Codex window
+whose own session isn't recorded as open, is recorded against that window.
 
 ### What it touches
 
@@ -170,8 +190,9 @@ Everything stays on your machine; respawn makes no network calls.
 ## FAQ
 
 **I closed one tab on purpose, and now it's offered.**
-Closing a tab ends a session the same way a crash does, so nothing can tell the two apart. Reopen only the
-ones you want (`1 3`), or run `respawn --clear`.
+Closing a tab ends a session the same way a crash does, so nothing can tell the two apart. The same goes for
+quitting an agent and closing its tab within two seconds. Reopen only the ones you want (`1 3`), or run
+`respawn --clear`.
 
 **Why not tmux and tmux-resurrect?** That works, if you live in tmux. respawn works in whatever terminal you
 already use, tmux included.

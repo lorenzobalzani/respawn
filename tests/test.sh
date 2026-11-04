@@ -1,6 +1,6 @@
 #!/bin/bash
 # Tests for respawn and install.sh, each against a throwaway HOME.
-# Needs bash, jq, python3 and a C compiler; tmux for the tmux tests (skipped without it).
+# Needs bash, jq, python3, perl and a C compiler; tmux for the tmux tests (skipped without it).
 # Run: tests/test.sh
 # shellcheck disable=SC2016 # jq programs and the hook's command line are single-quoted on purpose
 
@@ -90,6 +90,19 @@ session() {
   python3 "$ROOT/tests/in_terminal.py" "${close[@]+"${close[@]}"}" /bin/sh -c "$line; ${LINGER:-true}" </dev/null
 }
 
+# How long a shell stays after its agent quits, in the tests that quit one: longer than respawn waits for a
+# shell that is still closing.
+QUIT_LINGER="sleep 4"
+
+eventually() { # the check passes within a few seconds: it waits on what respawn does in the background
+  local _
+  for _ in $(seq 1 60); do
+    "$@" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 # One hook, run by an agent that lives just for it.
 hook() { session "$FAKES/$1" "$(hook_line "$@")"; }
 
@@ -115,6 +128,8 @@ lacks() { ! grep -qF -- "$2" <<<"$1"; }
 exists() { [ -e "$1" ]; }
 missing() { [ ! -e "$1" ]; }
 process_started() { LC_ALL=C ps -o lstart= -p "$1" | sed 's/^ *//; s/ *$//'; }
+backdate() { perl -e 'utime(time - $ARGV[1], time - $ARGV[1], $ARGV[0])' "$1" "$2"; }
+real_ps=$(command -v ps)
 
 echo "hooks: Claude Code"
 fresh_home
@@ -122,7 +137,7 @@ hook claude start '{"session_id":"s-1","cwd":"/work/api","transcript_path":"/t/s
 record="$STATE/claude.s-1.json"
 check "start records the session, its folder, its agent process and that process's shell" \
   jq -e '.agent == "claude" and .session_id == "s-1" and .cwd == "/work/api" and (.pid | type) == "number" and .process_started != ""
-         and .tty != "" and .parent_pid > 1 and .parent_started != ""' "$record"
+         and .tty != "" and .shell_pid > 1 and .shell_started != ""' "$record"
 session "$FAKES/claude" "$(hook_line claude prompt '{"session_id":"s-1","prompt":"/model opus"}');
   $(hook_line claude prompt '{"session_id":"s-1","prompt":"migrate the billing\ntables"}');
   $(hook_line claude prompt '{"session_id":"s-1","cwd":"/work/elsewhere","prompt":"go on"}')"
@@ -141,31 +156,55 @@ start_then_end() { # agent id end-payload [agent-command-line...]
   local agent=$1 id=$2 end=$3
   shift 3
   local start="{\"session_id\":\"$id\",\"cwd\":\"/work\"}" # built here: bash 3.2 garbles \" inside "$(...)"
-  LINGER="sleep 1" session "$@" "$(hook_line "$agent" start "$start"); cp $(quote "$STATE/$agent.$id.json") $(quote "$WORK/seen.$id");
+  LINGER=${LINGER:-$QUIT_LINGER} session "$@" "$(hook_line "$agent" start "$start"); cp $(quote "$STATE/$agent.$id.json") $(quote "$WORK/seen.$id");
     $(hook_line "$agent" end "$end")"
 }
 recorded_then_gone() { [ -e "$WORK/seen.$1" ] && [ ! -e "$STATE/$2.$1.json" ]; }
 for reason in prompt_input_exit clear resume logout; do
   id="left-${reason//_/-}"
-  start_then_end claude "$id" "{\"session_id\":\"$id\",\"reason\":\"$reason\"}" "$FAKES/claude"
+  LINGER=true start_then_end claude "$id" "{\"session_id\":\"$id\",\"reason\":\"$reason\"}" "$FAKES/claude"
   check "an end the agent calls deliberate forgets the session: $reason" recorded_then_gone "$id" claude
 done
 start_then_end claude s-quit '{"session_id":"s-quit","reason":"other"}' "$FAKES/claude"
-check "any other end, while the agent is still its shell's child, forgets it: you quit, the tab stays" recorded_then_gone s-quit claude
+check "any other end, while the agent is still its shell's child, forgets it: you quit, the tab stays" eventually recorded_then_gone s-quit claude
 # A closing terminal hangs up its shell, and the shell, going, its agent, which runs its end hook then.
 FAKE_AGENT_ON_HUP="$(hook_line claude end '{"session_id":"s-closed","reason":"other"}'); touch $(quote "$WORK/ended.s-closed")" \
   session --close-after 0.5 "$FAKES/claude" "$(hook_line claude start '{"session_id":"s-closed","cwd":"/work"}'); sleep 5"
 sleep 2
 check "an end after the terminal closed (the agent lost its shell) keeps the session" \
   bash -c "[ -e '$WORK/ended.s-closed' ] && [ -e '$STATE/claude.s-closed.json' ]"
+# zsh, hung up, hangs up its job, then saves its history and exits: it outlives its agent for a moment.
+zsh_like='trap "kill -HUP \$agent; sleep 1; exit 129" HUP; "$@" & agent=$!; wait $agent; sleep 5'
+FAKE_AGENT_ON_HUP="$(hook_line claude end '{"session_id":"s-slow-shell","reason":"other"}'); touch $(quote "$WORK/ended.s-slow-shell")" \
+  python3 "$ROOT/tests/in_terminal.py" --close-after 0.5 /bin/sh -c "$zsh_like" sh "$FAKES/claude" \
+  "$(hook_line claude start '{"session_id":"s-slow-shell","cwd":"/work"}'); sleep 5" </dev/null
+sleep 4
+check "  and when the shell takes a moment to go, after its agent" \
+  bash -c "[ -e '$WORK/ended.s-slow-shell' ] && [ -e '$STATE/claude.s-slow-shell.json' ]"
 session --close-after 0.3 "$FAKES/claude" "sleep 2; touch $(quote "$WORK/outlived")"
 sleep 2.5
 check "the stand-in's children get the HUP of a closing terminal, as an agent's do" missing "$WORK/outlived"
+LINGER=$QUIT_LINGER session "$FAKES/claude" "$(hook_line claude start '{"session_id":"s-slow-exit","cwd":"/work"}');
+  $(hook_line claude end '{"session_id":"s-slow-exit","reason":"other"}'); sleep 4"
+check "an agent that takes seconds to exit after its end hook (MCP servers stopping) has still quit" \
+  eventually missing "$STATE/claude.s-slow-exit.json"
+# Codex kills the process group of a hook that timed out: here the end hook gets a group of its own, killed whole.
+in_own_group='set -m; sh -c "$1" & wait $!; kill -KILL -- -$! 2>/dev/null; true'
+LINGER=$QUIT_LINGER session "$FAKES/claude" "$(hook_line claude start '{"session_id":"s-group","cwd":"/work"}');
+  bash -c $(quote "$in_own_group") _ $(quote "$(hook_line claude end '{"session_id":"s-group","reason":"other"}')"); sleep 1"
+check "the wait for the agent to exit survives the hook's process group being killed" eventually missing "$STATE/claude.s-group.json"
+mkdir -p "$WORK/count"
+printf '#!/bin/sh\necho >>%s\nexec %s "$@"\n' "$(quote "$WORK/ps-calls")" "$(quote "$real_ps")" >"$WORK/count/ps"
+chmod +x "$WORK/count/ps"
+PATH="$WORK/count:$PATH" hook claude start '{"session_id":"s-cheap","cwd":"/work"}'
+check "the start hook reads the process table once, not once per ancestor" \
+  bash -c "[ -e '$STATE/claude.s-cheap.json' ] && [ \$(wc -l <'$WORK/ps-calls') -le 5 ]"
 
 echo "hooks: Codex (its hooks run in a background daemon)"
 fresh_home
 mkdir -p "$HOME/work/web" "$HOME/work/api" "$HOME/work/ops"
-codex_hook() { printf '%s' "$2" | "$BIN" hook codex "$1"; } # from no Codex process at all, like its daemon
+# Run by Codex's daemon, which its windows share and which runs outside all of them.
+codex_hook() { "$FAKES/codex" app-server --listen unix:// "$(hook_line codex "$1" "$2")" </dev/null; }
 # a Codex window: the agent in a folder, under a shell, in a terminal
 (cd "$HOME/work/web" && session "$FAKES/codex" 'sleep 5') &
 sleep 0.7
@@ -178,13 +217,12 @@ codex_hook end '{"session_id":"c-1","reason":"other"}'
 sleep 3.5
 check "an end while its window stays open (Codex unloads idle sessions) keeps it" exists "$STATE/codex.c-1.json"
 wait
-(cd "$HOME/work/api" && python3 "$ROOT/tests/in_terminal.py" /bin/sh -c "$(quote "$FAKES/codex") 'sleep 1'; sleep 3" </dev/null) &
+(cd "$HOME/work/api" && python3 "$ROOT/tests/in_terminal.py" /bin/sh -c "$(quote "$FAKES/codex") 'sleep 1'; sleep 5" </dev/null) &
 sleep 0.7
 codex_hook start "{\"session_id\":\"c-3\",\"cwd\":\"$HOME/work/api\"}"
 sleep 0.8
 codex_hook end '{"session_id":"c-3","reason":"other"}'
-sleep 0.6
-check "an end after its window quit, while its shell lives on, forgets it" missing "$STATE/codex.c-3.json"
+check "an end after its window quit, while its shell lives on, forgets it" eventually missing "$STATE/codex.c-3.json"
 wait
 (cd "$HOME/work/ops" && python3 "$ROOT/tests/in_terminal.py" --close-after 2 /bin/sh -c "$(quote "$FAKES/codex") 'sleep 3.5'; true" </dev/null) &
 sleep 0.6
@@ -193,6 +231,46 @@ sleep 2 # the terminal closes; the window outlives it for a moment
 codex_hook end '{"session_id":"c-4","reason":"other"}'
 sleep 3.5
 check "an end after its terminal closed keeps it" exists "$STATE/codex.c-4.json"
+wait
+mkdir -p "$HOME/work/new" "$HOME/work/reboot" "$HOME/work/ide" "$HOME/work/npm"
+(cd "$HOME/work/new" && LINGER=$QUIT_LINGER session "$FAKES/codex" 'sleep 3') &
+sleep 0.7
+codex_hook start "{\"session_id\":\"c-5\",\"cwd\":\"$HOME/work/new\"}"
+window=$(jq .pid "$STATE/codex.c-5.json" 2>/dev/null)
+codex_hook end '{"session_id":"c-5","reason":"other"}' # /new: the window ends its session and starts another
+codex_hook start "{\"session_id\":\"c-6\",\"cwd\":\"$HOME/work/new\"}"
+check "a second session in the same window (/new, /resume) is recorded against it" \
+  jq -e --argjson pid "${window:-0}" '.pid == $pid' "$STATE/codex.c-6.json"
+check "  and replaces the first one's record: a window runs one session at a time" missing "$STATE/codex.c-5.json"
+(cd "$HOME/work/reboot" && session "$FAKES/codex" 'sleep 3') &
+sleep 0.7
+codex_hook start "{\"session_id\":\"c-7\",\"cwd\":\"$HOME/work/reboot\"}"
+# a record from before a reboot, whose pid the new window happens to have
+jq '.session_id = "before-reboot" | .process_started = "Thu Jan  1 00:00:00 1970"' "$STATE/codex.c-7.json" >"$STATE/codex.before-reboot.json"
+window=$(jq .pid "$STATE/codex.c-7.json" 2>/dev/null)
+rm -f "$STATE/codex.c-7.json"
+codex_hook start "{\"session_id\":\"c-8\",\"cwd\":\"$HOME/work/reboot\"}"
+check "an old record naming a pid that a window now has does not keep that window from its session" \
+  jq -e --argjson pid "${window:-0}" '.pid == $pid' "$STATE/codex.c-8.json"
+(cd "$HOME/work/ide" && session "$FAKES/codex" 'sleep 3') &
+sleep 0.7
+# an app-server of an IDE's or the Codex app's own, which talks to its client over stdio
+payload="{\"session_id\":\"ide-1\",\"cwd\":\"$HOME/work/ide\"}"
+"$FAKES/codex" app-server "$(hook_line codex start "$payload")" </dev/null
+check "a session from an app-server of its own (an IDE, the Codex app) is not taken for a window in its folder" \
+  missing "$STATE/codex.ide-1.json"
+codex_hook start "{\"session_id\":\"c-9\",\"cwd\":\"$HOME/work/ide\"}"
+check "  which stays free for its own session" exists "$STATE/codex.c-9.json"
+wait
+# npm's launcher on an older Node: node runs the native codex as its child, and exits with it
+(cd "$HOME/work/npm" && LINGER="sleep 5" session "$FAKES/node" /usr/local/lib/node_modules/@openai/codex/bin/codex.js \
+  "$(quote "$FAKES/codex") 'sleep 1.5'") &
+sleep 0.7
+codex_hook start "{\"session_id\":\"c-10\",\"cwd\":\"$HOME/work/npm\"}"
+cp "$STATE/codex.c-10.json" "$WORK/seen.c-10" 2>/dev/null
+codex_hook end '{"session_id":"c-10","reason":"other"}'
+check "with npm's launcher between the shell and Codex, a quit while the tab stays forgets it" \
+  eventually recorded_then_gone c-10 codex
 wait
 
 echo "hooks: Gemini CLI (one node process under another)"
@@ -216,7 +294,7 @@ check "not to the relaunched one inside it" bash -c "[ '$inner' != '$outer' ]"
 echo "hooks: Qwen Code"
 fresh_home
 start_then_end qwen q-1 '{"session_id":"q-1","reason":"prompt_input_exit"}' "$FAKES/node" /opt/lib/qwen-code/cli.js/qwen
-check "Qwen's prompt_input_exit, sent even when the terminal closes, is settled by the shell: here you quit" recorded_then_gone q-1 qwen
+check "Qwen's prompt_input_exit, sent even when the terminal closes, is settled by the shell: here you quit" eventually recorded_then_gone q-1 qwen
 FAKE_AGENT_ON_HUP="$(hook_line qwen end '{"session_id":"q-2","reason":"prompt_input_exit"}'); touch $(quote "$WORK/ended.q-2")" \
   session --close-after 0.5 "$FAKES/node" /opt/lib/qwen-code/cli.js/qwen "$(hook_line qwen start '{"session_id":"q-2","cwd":"/work/ml"}'); sleep 5"
 sleep 2
@@ -241,9 +319,24 @@ out=$(session "$FAKES/claude" "$(hook_line claude start '{"session_id":"quiet","
 check "the hooks print nothing: Kiro and Copilot hand a hook's output to the model" is "$out" ""
 hook opencode start '{"session_id":"ses_2fA9xQ","cwd":"/work/e"}'
 check "OpenCode: what its plugin sends, ses_ ids included" jq -e '.session_id == "ses_2fA9xQ"' "$STATE/opencode.ses_2fA9xQ.json"
-hook claude start '{"session_id":"wrong-agent","cwd":"/work"}' >/dev/null 2>&1
-session "$FAKES/copilot" "$(hook_line claude start '{"session_id":"cp-as-claude","cwd":"/work"}')"
-check "Copilot CLI also runs Claude Code's hooks: respawn does not take them for Claude sessions" missing "$STATE/claude.cp-as-claude.json"
+mkdir -p "$HOME/work/shared"
+(cd "$HOME/work/shared" && session "$FAKES/claude" 'sleep 3') & # a Claude Code window, not recorded yet
+sleep 0.7
+payload="{\"session_id\":\"cp-as-claude\",\"cwd\":\"$HOME/work/shared\"}"
+session "$FAKES/copilot" "$(hook_line claude start "$payload")"
+check "Copilot CLI also runs Claude Code's hooks: respawn does not take them for Claude sessions," \
+  missing "$STATE/claude.cp-as-claude.json"
+check "  not even for a Claude Code window open in the same folder" missing "$STATE/claude.cp-as-claude.json"
+wait
+mkdir -p "$HOME/work/oc"
+payload="{\"session_id\":\"ses_npm\",\"cwd\":\"$HOME/work/oc\"}"
+# npm's launcher for OpenCode: node, which runs the native binary as its child
+(cd "$HOME/work/oc" && LINGER="sleep 4" session "$FAKES/node" /usr/local/lib/node_modules/opencode-ai/bin/opencode \
+  "$(quote "$FAKES/opencode") $(quote "$(hook_line opencode start "$payload"); sleep 0.5")") &
+sleep 2 # OpenCode has quit (it has no end hook); its tab's shell is still there
+check "OpenCode installed with npm, quit while its tab stays, is not listed as cut off" \
+  bash -c "[ -e '$STATE/opencode.ses_npm.json' ] && ! '$BIN' --list | grep -qF '~/work/oc'"
+wait
 
 echo "listing"
 fresh_home
@@ -273,7 +366,6 @@ check "nor one whose agent is gone but whose tab is still open" lacks "$list" "w
 check "a session that never wrote a transcript is dropped" missing "$STATE/claude.never-written.json"
 check "a session cut off more than a week ago is dropped" missing "$STATE/claude.too-old.json"
 check "the count matches" has "$list" "1 agent session was cut off"
-
 echo "restoring"
 fake_record claude folder-gone "$HOME/no/such/folder"
 transcript folder-gone
@@ -292,6 +384,42 @@ check "--clear forgets the cut-off sessions" missing "$STATE/claude.cut-off.json
 check "--clear keeps the ones still running" exists "$STATE/claude.still-running.json"
 kill "$running_pid" "$shell_pid" 2>/dev/null
 wait "$running_pid" "$shell_pid" 2>/dev/null
+
+echo "listing: dates, previews, start times"
+fresh_home
+mkdir -p "$HOME/work/copilot" "$HOME/work/kiro"
+week_and_a_day=$((8 * 86400))
+fake_record copilot cp-old "$HOME/work/copilot" # no transcript: Copilot CLI, Kiro CLI and OpenCode send none
+fake_record kiro k-old "$HOME/work/kiro"
+jq '.first_prompt = "earlier"' "$STATE/kiro.k-old.json" >"$WORK/r" && mv "$WORK/r" "$STATE/kiro.k-old.json"
+for id in copilot.cp-old kiro.k-old; do
+  jq --argjson ago "$week_and_a_day" '.transcript = "" | .recorded_at -= $ago' "$STATE/$id.json" >"$WORK/r" && mv "$WORK/r" "$STATE/$id.json"
+  backdate "$STATE/$id.json" "$week_and_a_day"
+done
+hook copilot prompt '{"sessionId":"cp-old","prompt":"still at it"}'
+session "$FAKES/kiro-cli" "$(hook_line kiro prompt '{"session_id":"k-old","prompt":"and this"}')"
+list=$("$BIN" --list)
+check "a session with no transcript, started 8 days ago and prompted since, is still offered" \
+  bash -c "grep -qF 'still at it' <<<\"\$1\" && grep -qF 'earlier' <<<\"\$1\"" _ "$list"
+check "  and dated by its last prompt" bash -c "[ \$(grep -c ' 0m ago ' <<<\"\$1\") -eq 2 ]" _ "$list"
+if [ -r /proc/self/stat ]; then
+  fresh_home
+  # procps computes ps's start time from the clock: once the clock is stepped (NTP), it moves
+  mkdir -p "$WORK/clock"
+  printf '#!/bin/bash\ncase " $* " in *lstart*) %s "$@" | sed "s/[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/00:00:00/" ;; *) exec %s "$@" ;; esac\n' \
+    "$(quote "$real_ps")" "$(quote "$real_ps")" >"$WORK/clock/ps"
+  chmod +x "$WORK/clock/ps"
+  (session "$FAKES/claude" "$(hook_line claude start '{"session_id":"live","cwd":"/work"}'); sleep 4") &
+  sleep 1.5
+  echo '{}' >"$WORK/t.jsonl"
+  jq --arg t "$WORK/t.jsonl" '.transcript = $t' "$STATE/claude.live.json" >"$WORK/r" && mv "$WORK/r" "$STATE/claude.live.json"
+  check "Linux: a session still running is not taken for cut off once the clock has been stepped" \
+    bash -c "[ -e '$STATE/claude.live.json' ] && PATH='$WORK/clock':\$PATH '$BIN' --list | grep -q 'No cut-off agent sessions'"
+  wait
+else
+  skip "Linux start times and a stepped clock: no /proc here (macOS's start times don't move with the clock)"
+fi
+
 
 echo "terminals: tmux"
 if command -v tmux >/dev/null; then
@@ -324,7 +452,6 @@ else
 fi
 
 echo "terminals: what each one is sent (stubbed)"
-backdate() { perl -e 'utime(time - $ARGV[1], time - $ARGV[1], $ARGV[0])' "$1" "$2"; }
 reopen_in() { # terminal: reopens two sessions there, one in a folder with a space; leaves what was sent in $SENT
   fresh_home
   mkdir -p "$HOME/work/a b" "$HOME/work/c"

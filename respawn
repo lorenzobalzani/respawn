@@ -4,10 +4,10 @@
 # https://github.com/lorenzobalzani/respawn
 #
 # Each agent's hooks keep a record of its interactive sessions:
-#   respawn hook <agent> start    the session id, its folder, the agent process running it
-#   respawn hook <agent> prompt   the same, if it is not recorded yet
+#   respawn hook <agent> start    the session id, its folder, the agent process running it, the tab's shell
+#   respawn hook <agent> prompt   the same, if it is not recorded yet; otherwise the time of its last prompt
 #   respawn hook <agent> end      forget it, when you left on purpose (/exit, /clear, ...)
-# A recorded session whose agent process no longer runs was cut off.
+# A recorded session whose agent process and shell no longer run was cut off.
 #
 # Usage:
 #   respawn                  list the cut-off sessions, ask, reopen them in new tabs
@@ -32,7 +32,9 @@ MAX_AGE_DAYS=7 # a session cut off longer ago than this is dropped rather than o
 PREVIEW_CHARS=60
 PATH_CHARS=28
 ANCESTOR_DEPTH=8
-SEP=$'\x1f' # field separator: not whitespace, so an empty field stays a field
+SETTLE_SECONDS=30      # how long an agent may take to exit after its end hook (MCP servers, telemetry)
+SHELL_GRACE_SECONDS=2  # how long a closing terminal's shell may outlive its agent (zsh saves its history)
+SEP=$'\x1f'            # field separator: not whitespace, so an empty field stays a field
 
 say() { printf '%s\n' "$*"; }
 plural() { if [ "$1" = 1 ]; then echo "$2"; else echo "${2}s"; fi; }
@@ -41,8 +43,6 @@ warn() { printf 'respawn: %s\n' "$*" >&2; }
 # ---------- small helpers ----------
 
 valid_id() { case "$1" in '' | *[!A-Za-z0-9._-]* | .*) return 1 ;; esac }
-
-started_at() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
 
 modified_at() {
   if [ "$(uname)" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi
@@ -395,48 +395,133 @@ unhook_filter() {
 known_agent() { case " $AGENTS " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # ---------- processes ----------
+# A process is named by its pid and its start: after a reboot a pid is soon reused. The hooks read the process
+# table once (load_processes) and walk it, rather than asking ps about one process at a time.
 
-parent_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
+BOOT_ID=""
 
-# Alive, and the same process: after a reboot a pid is soon reused, and a zombie still answers kill -0.
-alive() {
-  [ -n "$1" ] && [ -n "$2" ] || return 1
-  case "$(ps -o stat= -p "$1" 2>/dev/null)" in '' | Z*) return 1 ;; esac
-  [ "$(started_at "$1")" = "$2" ]
+# The start of a Linux process: "<state> <ticks since boot>@<boot>", from /proc. Unlike ps's start time, which
+# procps derives from the wall clock, a clock that is stepped (NTP, a VM's time sync) does not move it.
+linux_start() {
+  local stat fields
+  [ -r "/proc/$1/stat" ] || return 1
+  { read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
+  [ -n "$BOOT_ID" ] || { read -r BOOT_ID </proc/sys/kernel/random/boot_id; } 2>/dev/null
+  read -r -a fields <<<"${stat##*) }" # after the command name, which may hold spaces: field 3 on
+  [ "${#fields[@]}" -ge 20 ] || return 1
+  echo "${fields[0]} ${fields[19]}@$BOOT_ID"
 }
 
-is_agent_pid() { agent_is_process "$1" "$(ps -ww -o comm= -p "$2" 2>/dev/null)" "$(ps -ww -o args= -p "$2" 2>/dev/null)"; }
+started_at() {
+  local start
+  if start=$(linux_start "$1"); then
+    echo "${start#* }"
+  else
+    LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'
+  fi
+}
+
+# Alive, and the same process: a pid may have been reused, and a zombie still answers kill -0. A start in
+# ps's format (macOS, and records from respawn 0.2.0 on Linux) is checked against ps.
+alive() {
+  local start state
+  if [ -z "$2" ] || ! [ "${1:-0}" -gt 1 ] 2>/dev/null; then return 1; fi
+  case "$2" in
+    *@*)
+      start=$(linux_start "$1") || return 1
+      case "$start" in Z* | X* | x*) return 1 ;; esac
+      [ "${start#* }" = "$2" ]
+      ;;
+    *)
+      start=$(LC_ALL=C ps -o stat=,lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//')
+      state=${start%% *}
+      case "$state" in '' | Z*) return 1 ;; esac
+      start=${start#"$state"}
+      [ "$(printf '%s' "$start" | sed 's/^ *//')" = "$2" ]
+      ;;
+  esac
+}
+
+PROCS=""
+
+# One line per process: pid, parent, state, name, command line, separated by SEP. Not its terminal: on macOS,
+# naming every process's terminal takes ps longer than all the rest.
+load_processes() {
+  PROCS=$(awk -v sep="$SEP" '
+    FNR == NR { pid = $1; sub(/^ *[0-9]+ ?/, ""); args[pid] = $0; next }
+    { pid = $1; parent = $2; state = $3
+      sub(/^ *[0-9]+ +[0-9]+ +[^ ]+ */, "")
+      print pid sep parent sep state sep $0 sep args[pid] }' \
+    <(ps -A -ww -o pid=,args= 2>/dev/null) <(ps -A -ww -o pid=,ppid=,stat=,comm= 2>/dev/null))
+}
+
+tty_of() { ps -o tty= -p "$1" 2>/dev/null | tr -d ' '; }
+
+ancestry() { # the process and the processes above it, nearest first, up to $2 of them: one line each
+  printf '%s\n' "$PROCS" | awk -F "$SEP" -v pid="$1" -v depth="$2" '
+    { line[$1] = $0; parent[$1] = $2 }
+    END { while (depth-- > 0 && (pid in line) && pid + 0 > 1) { print line[pid]; pid = parent[pid] } }'
+}
+
+has_tty() { case "$1" in '' | '?' | '??') return 1 ;; esac; }
 
 # Is this process some other agent than this one? (Copilot CLI and Cursor CLI run Claude Code's hooks too.)
-other_agent_pid() {
-  local agent=$1 comm args other
-  comm=$(ps -ww -o comm= -p "$2" 2>/dev/null)
-  args=$(ps -ww -o args= -p "$2" 2>/dev/null)
+other_agent() {
+  local agent=$1 other
   for other in $AGENTS; do
-    [ "$other" != "$agent" ] && agent_is_process "$other" "$comm" "$args" && return 0
+    [ "$other" != "$agent" ] && agent_is_process "$other" "$2" "$3" && return 0
   done
   return 1
 }
 
-# The agent process running this hook: the nearest ancestor that is the agent, then up to its
-# outermost process (Gemini CLI, for one, runs as a node process under another). A hook belongs to its
-# nearest agent: meeting another agent first means this hook is not this agent's.
+# The agent process running this hook: the nearest ancestor that is the agent, then up to its outermost
+# process (Gemini CLI, for one, runs as a node process under another). Fails with 1 when no agent is above
+# the hook; 2 when the hook is not this agent's: another agent comes first (a hook belongs to its nearest
+# agent), or a Codex app-server serving a client of its own (an IDE, the Codex app); 3 when the hook runs
+# in the daemon that Codex's terminal windows share.
 agent_pid() {
-  local agent=$1 pid=$PPID parent _
-  for _ in $(seq 1 "$ANCESTOR_DEPTH"); do
-    [ "$pid" -gt 1 ] 2>/dev/null || return 1
-    other_agent_pid "$agent" "$pid" && return 1
-    if is_agent_pid "$agent" "$pid"; then
-      parent=$(parent_of "$pid")
-      while [ "$parent" -gt 1 ] 2>/dev/null && is_agent_pid "$agent" "$parent"; do
-        pid=$parent
-        parent=$(parent_of "$pid")
-      done
-      echo "$pid"
-      return 0
+  local agent=$1 pid name args found="" n=0
+  while IFS=$SEP read -r pid _ _ name args; do
+    if [ -n "$found" ]; then
+      agent_is_process "$agent" "$name" "$args" || break
+      found=$pid
+      continue
     fi
-    pid=$(parent_of "$pid")
-  done
+    n=$((n + 1))
+    [ "$n" -le "$ANCESTOR_DEPTH" ] || return 1
+    if [ "$agent" = codex ] && [ "${name##*/}" = codex ]; then
+      case "$args" in
+        *app-server*unix://*) return 3 ;;
+        *app-server*) return 2 ;;
+      esac
+    fi
+    other_agent "$agent" "$name" "$args" && return 2
+    agent_is_process "$agent" "$name" "$args" && found=$pid
+  done < <(ancestry "$PPID" $((ANCESTOR_DEPTH * 3)))
+  [ -n "$found" ] || return 1
+  echo "$found"
+}
+
+# The tab's shell: the nearest session leader above the agent, which is what the terminal started. A launcher
+# in between (npm's node, npx, caffeinate, mise exec) goes when the agent goes, so it can't stand in for the
+# tab. The agent's parent, when no session leader is near.
+shell_of() {
+  local pid parent state first=""
+  while IFS=$SEP read -r pid parent state _; do
+    if [ -z "$first" ]; then # the agent itself
+      first=$parent
+      continue
+    fi
+    case "$state" in *s*) echo "$pid" && return 0 ;; esac
+  done < <(ancestry "$1" $((ANCESTOR_DEPTH + 1)))
+  echo "$first"
+}
+
+under() { # is process $1 still below process $2?
+  local pid
+  while IFS=$SEP read -r pid _; do
+    [ "$pid" = "$2" ] && return 0
+  done < <(ancestry "$1" $((ANCESTOR_DEPTH * 3)))
   return 1
 }
 
@@ -444,22 +529,31 @@ process_cwd() {
   if [ -d /proc ]; then readlink "/proc/$1/cwd"; else lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'; fi
 }
 
-# For an agent whose hooks run in a daemon: its interactive process in that folder, not yet claimed by
-# another of its sessions. With several, the newest.
+# For an agent whose hooks run in a daemon (Codex): its window in that folder, an interactive process with a
+# terminal, that no session recorded as still open in it claims. With several, the newest.
 agent_pid_by_cwd() {
-  local agent=$1 cwd real pid tty name found=""
+  local agent=$1 real pid name args cwd claims found=""
   real=$(cd "$2" 2>/dev/null && pwd -P) || return 1
-  while read -r pid tty name; do
-    case "$tty" in '' | '?' | '??') continue ;; esac
-    case "${name##*/}" in "$(agent_binary "$agent")" | node | bun) ;; *) continue ;; esac # cheap, before asking ps
-    is_agent_pid "$agent" "$pid" || continue
+  claims=$(jq -r 'select(.ended_at == null) | "\(.pid)\u001f\(.process_started)"' "$RECORDS/$agent".*.json 2>/dev/null)
+  while IFS=$SEP read -r pid _ _ name args; do
+    agent_is_process "$agent" "$name" "$args" || continue
+    has_tty "$(tty_of "$pid")" || continue
     cwd=$(process_cwd "$pid")
     [ -n "$cwd" ] || continue
     [ "$(cd "$cwd" 2>/dev/null && pwd -P)" = "$real" ] || continue
-    if grep -qs "\"pid\": $pid," "$RECORDS/$agent".*.json; then continue; fi # another of its sessions
+    claimed "$pid" "$claims" && continue # by another of its sessions, live
     found=$pid
-  done < <(ps -A -ww -o pid=,tty=,comm= | sort -n)
+  done < <(printf '%s\n' "$PROCS" | awk -F "$SEP" -v bin="$(agent_binary "$agent")" '
+      { name = $4; sub(/.*\//, "", name); if (name == bin || name == "node" || name == "bun") print }' | sort -n)
   [ -n "$found" ] && echo "$found"
+}
+
+claimed() { # does one of these "pid SEP start" lines name process $1, alive?
+  local pid start
+  while IFS=$SEP read -r pid start; do
+    if [ "$pid" = "$1" ] && alive "$pid" "$start"; then return 0; fi
+  done <<<"$2"
+  return 1
 }
 
 # ---------- the hooks ----------
@@ -477,7 +571,7 @@ hook() {
     start) record "$agent" "$id" "$cwd" "$transcript" "" ;;
     prompt)
       if [ -f "$file" ]; then
-        if [ -n "$prompt" ]; then remember_prompt "$file" "$prompt"; fi
+        prompted "$file" "$prompt"
       else
         record "$agent" "$id" "$cwd" "$transcript" "$prompt" # a session open before respawn was installed
       fi
@@ -487,30 +581,63 @@ hook() {
 }
 
 record() {
-  local agent=$1 id=$2 cwd=$3 transcript=$4 prompt=$5 file pid tty parent first=""
+  local agent=$1 id=$2 cwd=$3 transcript=$4 prompt=$5 file pid tty shell shell_started="" started first=""
   file="$RECORDS/$agent.$id.json"
   if [ -f "$file" ]; then first=$(jq -r '.first_prompt // ""' "$file" 2>/dev/null); fi
   [ -n "$first" ] || first=$prompt
-  # Codex runs its hooks in a background daemon, not under the window you type in: find that window by its folder
-  pid=$(agent_pid "$agent") || pid=$(agent_pid_by_cwd "$agent" "$cwd")
-  [ -n "$pid" ] || return 0
-  tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
-  case "$tty" in '' | '?' | '??') return 0 ;; esac # headless runs and background sessions have no terminal
-  parent=$(parent_of "$pid")
+  load_processes
+  pid=$(agent_pid "$agent")
+  case $? in
+    0) ;;
+    1 | 3) # Codex runs its hooks in a daemon, not under the window you type in: find that window by its folder
+      [ "$agent" = codex ] || return 0
+      pid=$(agent_pid_by_cwd "$agent" "$cwd") || return 0
+      ;;
+    *) return 0 ;;
+  esac
+  tty=$(tty_of "$pid")
+  has_tty "$tty" || return 0 # headless runs and background sessions have no terminal
+  shell=$(shell_of "$pid")
+  if [ -n "$shell" ]; then shell_started=$(started_at "$shell"); fi
+  started=$(started_at "$pid")
   mkdir -p "$RECORDS"
   jq -n --arg agent "$agent" --arg id "$id" --arg cwd "$cwd" --arg transcript "$transcript" \
-    --argjson pid "$pid" --arg started "$(started_at "$pid")" --arg tty "$tty" \
-    --argjson parent "${parent:-0}" --arg parent_started "$(started_at "${parent:-0}")" \
+    --argjson pid "$pid" --arg started "$started" --arg tty "$tty" \
+    --argjson shell "${shell:-0}" --arg shell_started "$shell_started" \
     --arg first "$first" --arg terminal "$(detect_terminal)" --argjson now "$(date +%s)" \
     '{agent: $agent, session_id: $id, cwd: $cwd, transcript: $transcript, pid: $pid, process_started: $started,
-      tty: $tty, parent_pid: $parent, parent_started: $parent_started, first_prompt: $first,
+      tty: $tty, shell_pid: $shell, shell_started: $shell_started, first_prompt: $first,
       terminal: $terminal, recorded_at: $now}' \
     >"$file.$$" && mv "$file.$$" "$file"
+  replaced "$agent" "$id" "$pid"
 }
 
-remember_prompt() { # the session's first prompt, kept once
-  jq -e '(.first_prompt // "") == ""' "$1" >/dev/null 2>&1 || return 0
-  jq --arg prompt "$2" '.first_prompt = $prompt' "$1" >"$1.$$" && mv "$1.$$" "$1"
+# A process runs one session at a time: a session recorded in it replaces any other recorded there before
+# (Codex starts a new one in the same window with /new, and its end does not say so).
+replaced() {
+  local agent=$1 id=$2 pid=$3 other start
+  for other in "$RECORDS/$agent".*.json; do
+    if [ ! -f "$other" ] || [ "$other" = "$RECORDS/$agent.$id.json" ]; then continue; fi
+    grep -q "\"pid\": $pid," "$other" || continue
+    start=$(jq -r '.process_started // ""' "$other" 2>/dev/null)
+    if alive "$pid" "$start"; then rm -f "$other"; fi
+  done
+}
+
+# A prompt in a recorded session. It is active now: its record's time dates an agent that has no transcript,
+# and a session that ended while its process stayed (Codex unloads idle ones) is open again.
+prompted() {
+  local file=$1 prompt=$2
+  if grep -q '"ended_at"' "$file" || { [ -n "$prompt" ] && grep -q '"first_prompt": ""' "$file"; }; then
+    jq --arg prompt "$prompt" 'del(.ended_at) | if (.first_prompt // "") == "" then .first_prompt = $prompt else . end' \
+      "$file" >"$file.$$" && mv "$file.$$" "$file"
+  else
+    touch "$file"
+  fi
+}
+
+forget_if_unchanged() { # forgets a record only while it still names this process: a new one has recorded itself
+  [ "$(jq -r '"\(.pid)\u001f\(.process_started)"' "$1" 2>/dev/null)" = "$2$SEP$3" ] && rm -f "$1"
 }
 
 # Linux signals every process at once when it shuts down: don't read that as you quitting.
@@ -518,37 +645,51 @@ shutting_down() { command -v systemctl >/dev/null && [ "$(systemctl is-system-ru
 
 # A session ended. Forget it if you left it on purpose; keep it if its terminal went away.
 end_hook() {
-  local agent=$1 file=$2 reason=$3 pid started parent parent_started
+  local agent=$1 file=$2 reason=$3 pid started shell shell_started
   [ -f "$file" ] || return 0
   if agent_switched_session "$agent" "$reason"; then
     rm -f "$file"
     return 0
   fi
   shutting_down && return 0
-  IFS=$SEP read -r pid started parent parent_started < <(jq -r \
-    '[.pid, .process_started, .parent_pid, .parent_started] | map(. // "" | tostring) | join("\u001f")' "$file")
-  # Moved to another parent: its shell went first, which is what a closing terminal does. Keep it.
-  if alive "$pid" "$started" && [ "$(parent_of "$pid")" != "$parent" ]; then return 0; fi
-  # Otherwise wait for the agent to exit, in the background so that it can go on exiting.
+  IFS=$SEP read -r pid started shell shell_started < <(jq -r \
+    '[.pid, .process_started, (.shell_pid // .parent_pid), (.shell_started // .parent_started)] | map(. // "" | tostring) | join("\u001f")' "$file")
+  # Its process is free for the next session it runs (Codex runs one after another in a window).
+  jq --argjson now "$(date +%s)" '.ended_at = $now' "$file" >"$file.$$" && mv "$file.$$" "$file"
+  if alive "$pid" "$started"; then
+    load_processes
+    # Its shell is gone, or it is no longer below it: the shell went first, which is what a closing terminal does.
+    if ! alive "$shell" "$shell_started" || ! under "$pid" "$shell"; then return 0; fi
+  fi
+  # Otherwise wait for the agent to exit, in the background so that it can go on exiting. In a process group of
+  # its own, so that a signal to the agent's group or the hook's (Codex kills the group of a hook that timed out)
+  # does not reach it.
   (
-    trap '' HUP
-    settle_end "$file" "$pid" "$started" "$parent" "$parent_started"
-  ) </dev/null >/dev/null 2>&1 &
+    set -m
+    (
+      trap '' HUP
+      settle_end "$file" "$pid" "$started" "$shell" "$shell_started"
+    ) </dev/null >/dev/null 2>&1 &
+  ) </dev/null >/dev/null 2>&1
   return 0
 }
 
-# The agent exited and its shell, the tab, is still there: you quit it. Still running after a few seconds:
-# the agent only ended an idle session (Codex does, after 30 minutes), and the session is still open.
+# The agent exited and its shell, the tab, is still there: you quit it. Still running after a while: the agent
+# only ended an idle session (Codex does, after 30 minutes), and the session is still open.
 settle_end() {
-  local file=$1 pid=$2 started=$3 parent=$4 parent_started=$5 _
-  for _ in $(seq 1 30); do
+  local file=$1 pid=$2 started=$3 shell=$4 shell_started=$5 _
+  for _ in $(seq 1 $((SETTLE_SECONDS * 5))); do
     alive "$pid" "$started" || break
-    sleep 0.1
+    sleep 0.2
   done
   alive "$pid" "$started" && return 0
-  alive "$parent" "$parent_started" || return 0
-  # unless the session was reopened elsewhere meanwhile, and recorded with its new process
-  [ "$(jq -r '.pid' "$file" 2>/dev/null)" = "$pid" ] && rm -f "$file"
+  # A closing terminal takes the shell too, though not always at once: zsh saves its history first.
+  for _ in $(seq 1 $((SHELL_GRACE_SECONDS * 5))); do
+    alive "$shell" "$shell_started" || return 0
+    sleep 0.2
+  done
+  alive "$shell" "$shell_started" || return 0
+  forget_if_unchanged "$file" "$pid" "$started" # unless the session was reopened elsewhere meanwhile
 }
 
 # ---------- terminals ----------
@@ -874,17 +1015,16 @@ open_print() {
 
 # One line per cut-off session, newest first: agent, id, cwd, last activity (epoch), preview.
 cut_off_sessions() {
-  local file agent id cwd transcript pid started parent parent_started recorded first mtime now preview
+  local file agent id cwd transcript pid started shell shell_started first mtime now preview
   now=$(date +%s)
   for file in "$RECORDS"/*.json; do
     [ -e "$file" ] || continue
-    IFS=$SEP read -r agent id cwd transcript pid started parent parent_started recorded first < <(jq -r \
-      '[.agent, .session_id, .cwd, .transcript, .pid, .process_started, .parent_pid, .parent_started, .recorded_at, .first_prompt]
-       | map(. // "" | tostring) | join("\u001f")' "$file")
+    IFS=$SEP read -r agent id cwd transcript pid started shell shell_started first < <(jq -r \
+      '[.agent, .session_id, .cwd, .transcript, .pid, .process_started, (.shell_pid // .parent_pid),
+        (.shell_started // .parent_started), .first_prompt] | map(. // "" | tostring) | join("\u001f")' "$file")
     known_agent "$agent" || continue
-    alive "$pid" "$started" && continue           # still running
-    alive "$parent" "$parent_started" && continue # it ended while its tab stayed open: you saw it go
-    mtime=$recorded
+    alive "$pid" "$started" && continue          # still running
+    alive "$shell" "$shell_started" && continue # it ended while its tab stayed open: you saw it go
     if [ -n "$transcript" ]; then
       [ -f "$transcript.zst" ] && transcript="$transcript.zst" # Codex recompresses a session it has not touched for a while
       if [ ! -f "$transcript" ]; then # never got a message: nothing to resume
@@ -892,6 +1032,8 @@ cut_off_sessions() {
         continue
       fi
       mtime=$(modified_at "$transcript")
+    else
+      mtime=$(modified_at "$file") # each prompt touches the record of an agent that has no transcript
     fi
     if [ $((now - mtime)) -gt $((MAX_AGE_DAYS * 86400)) ]; then
       rm -f "$file"
