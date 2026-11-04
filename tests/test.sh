@@ -717,6 +717,18 @@ PATH="$WORK/bin:$PATH" "$BIN" uninstall >/dev/null
 check "uninstall takes respawn's hooks out of every agent" bash -c "! grep -qs 'respawn hook' '$HOME/.gemini/settings.json' '$HOME/.codex/hooks.json'"
 check "a config file keeps its permissions" bash -c "[ \"\$(ls -l '$HOME/.codex/hooks.json' | cut -c1-10)\" = '-rw-r--r--' ]"
 check "and leaves the agents' own hooks" jq -e '.hooks.Stop[0].hooks[0].command == "notify-me"' "$HOME/.codex/hooks.json"
+fresh_home
+agents_on_path 0.66.0 0.14.0
+PATH="$WORK/bin:$PATH" "$BIN" setup >/dev/null
+qwen_settings="$HOME/.qwen/settings.json"
+printf '%s' "$(jq '. + {"$version": 2}' "$qwen_settings")" >"$WORK/q" && cat "$WORK/q" >"$qwen_settings" # as Qwen Code rewrites it
+cp "$qwen_settings" "$WORK/qwen.before"
+cp "$qwen_settings.bak-respawn" "$WORK/qwen.backup"
+out=$(PATH="$WORK/bin:$PATH" "$BIN" setup)
+check "a config its agent rewrote its own way (no final newline) still has the hooks, setting up again" \
+  has "$out" "Qwen Code: hooks already there"
+check "  and is left as it is, and so is the backup of what was there before respawn" \
+  bash -c "cmp -s '$WORK/qwen.before' '$qwen_settings' && cmp -s '$WORK/qwen.backup' '$qwen_settings.bak-respawn'"
 
 fresh_home
 agents_on_path 0.66.0

@@ -95,7 +95,8 @@ edit_json() {
     warn "could not update $file"
     return 2
   fi
-  if cmp -s "$tmp" "$target"; then
+  # The same JSON, if only written another way (Qwen Code drops the final newline), has nothing to change.
+  if cmp -s "$tmp" "$target" || [ "$(jq -cS . "$tmp")" = "$(jq -cS . "$target")" ]; then
     rm -f "$tmp"
     return 1
   fi
