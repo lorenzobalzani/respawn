@@ -198,8 +198,8 @@ shellcheck -x respawn install.sh tests/test.sh
 
 The tests give every agent a realistic life: a pseudo-terminal, a shell in it, a stand-in for the agent under the
 shell (`tests/fake_agent.c`), and the agent's hooks run by it, including a terminal that closes mid-session
-(`tests/in_terminal.py`). Each terminal is driven through a stub that records what respawn sent it, and tmux
-for real. CI runs it all on macOS and Ubuntu.
+(`tests/in_terminal.py`), which hangs up the stand-in the way it hangs up a real agent. Each terminal is driven
+through a stub that records what respawn sent it, and tmux for real. CI runs it all on macOS and Ubuntu.
 
 ## License
 

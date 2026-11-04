@@ -152,10 +152,15 @@ for reason in prompt_input_exit clear resume logout; do
 done
 start_then_end claude s-quit '{"session_id":"s-quit","reason":"other"}' "$FAKES/claude"
 check "any other end, while the agent is still its shell's child, forgets it: you quit, the tab stays" recorded_then_gone s-quit claude
-session --close-after 0.5 "$FAKES/claude" "$(hook_line claude start '{"session_id":"s-closed","cwd":"/work"}');
-  sleep 1.5; $(hook_line claude end '{"session_id":"s-closed","reason":"other"}')"
-sleep 2 # the agent outlives its terminal, then runs its end hook
-check "an end after the terminal closed (the agent lost its shell) keeps the session" exists "$STATE/claude.s-closed.json"
+# A closing terminal hangs up its shell, and the shell, going, its agent, which runs its end hook then.
+FAKE_AGENT_ON_HUP="$(hook_line claude end '{"session_id":"s-closed","reason":"other"}'); touch $(quote "$WORK/ended.s-closed")" \
+  session --close-after 0.5 "$FAKES/claude" "$(hook_line claude start '{"session_id":"s-closed","cwd":"/work"}'); sleep 5"
+sleep 2
+check "an end after the terminal closed (the agent lost its shell) keeps the session" \
+  bash -c "[ -e '$WORK/ended.s-closed' ] && [ -e '$STATE/claude.s-closed.json' ]"
+session --close-after 0.3 "$FAKES/claude" "sleep 2; touch $(quote "$WORK/outlived")"
+sleep 2.5
+check "the stand-in's children get the HUP of a closing terminal, as an agent's do" missing "$WORK/outlived"
 
 echo "hooks: Codex (its hooks run in a background daemon)"
 fresh_home
@@ -212,10 +217,10 @@ echo "hooks: Qwen Code"
 fresh_home
 start_then_end qwen q-1 '{"session_id":"q-1","reason":"prompt_input_exit"}' "$FAKES/node" /opt/lib/qwen-code/cli.js/qwen
 check "Qwen's prompt_input_exit, sent even when the terminal closes, is settled by the shell: here you quit" recorded_then_gone q-1 qwen
-session --close-after 0.5 "$FAKES/node" /opt/lib/qwen-code/cli.js/qwen "$(hook_line qwen start '{"session_id":"q-2","cwd":"/work/ml"}');
-  sleep 1.5; $(hook_line qwen end '{"session_id":"q-2","reason":"prompt_input_exit"}')"
+FAKE_AGENT_ON_HUP="$(hook_line qwen end '{"session_id":"q-2","reason":"prompt_input_exit"}'); touch $(quote "$WORK/ended.q-2")" \
+  session --close-after 0.5 "$FAKES/node" /opt/lib/qwen-code/cli.js/qwen "$(hook_line qwen start '{"session_id":"q-2","cwd":"/work/ml"}'); sleep 5"
 sleep 2
-check "and here the terminal closed, so it is kept" exists "$STATE/qwen.q-2.json"
+check "and here the terminal closed, so it is kept" bash -c "[ -e '$WORK/ended.q-2' ] && [ -e '$STATE/qwen.q-2.json' ]"
 
 echo "hooks: Copilot CLI, Cursor CLI, Factory Droid, Kiro CLI, OpenCode"
 fresh_home
@@ -297,7 +302,11 @@ if command -v tmux >/dev/null; then
   transcript one
   fake_record claude two "$HOME/work/c"
   transcript two
-  tmux new-session -d -s respawn-test -x 200 -y 50
+  # the windows' shells find a stand-in claude, not one that may be installed here
+  mkdir -p "$WORK/agents"
+  printf '#!/bin/sh\necho "resuming $*"\n' >"$WORK/agents/claude"
+  chmod +x "$WORK/agents/claude"
+  PATH="$WORK/agents:$PATH" tmux new-session -d -s respawn-test -x 200 -y 50
   TMUX=$(tmux display-message -p '#{socket_path},#{pid},0') "$BIN" --in tmux -y >/dev/null
   sleep 1
   paths=$(tmux list-windows -t respawn-test -F '#{pane_current_path}')
@@ -305,7 +314,8 @@ if command -v tmux >/dev/null; then
   c=$(cd "$HOME/work/c" && pwd -P)
   check "a tmux window opens in each session's folder, spaces and all" bash -c "grep -qxF \"\$1\" <<<\"\$3\" && grep -qxF \"\$2\" <<<\"\$3\"" _ "$a_b" "$c" "$paths"
   typed=$(for w in $(tmux list-windows -t respawn-test -F '#{window_id}'); do tmux capture-pane -p -t "$w"; done)
-  check "and types the session's resume command" bash -c "grep -qF 'claude --resume one' <<<'$typed' && grep -qF 'claude --resume two' <<<'$typed'"
+  check "and types the session's resume command" \
+    bash -c "grep -qF 'claude --resume one' <<<\"\$1\" && grep -qF 'claude --resume two' <<<\"\$1\"" _ "$typed"
   check "the reopened sessions' records are cleared (each records itself again)" missing "$STATE/claude.one.json"
   tmux kill-server
   unset TMUX_TMPDIR
