@@ -49,11 +49,13 @@ for command in osascript open xdg-open kitty wezterm alacritty ghostty gnome-ter
   for arg in "$@"; do echo "arg: $arg"; done
   if [ ! -t 0 ]; then sed 's/^/stdin: /'; fi
 } >>"$STUB_LOG"
+if [ -n "${STUB_RUN:-}" ]; then eval "$STUB_RUN"; fi # what happens while the terminal opens its tabs
 if [ "${0##*/}" = wezterm ] && [ "${2:-}" = spawn ]; then # wezterm cli spawn prints the new pane's id
   n=$(($(cat "$STUB_LOG.panes" 2>/dev/null || echo 0) + 1))
   echo "$n" >"$STUB_LOG.panes"
   echo "$n"
 fi
+exit "${STUB_EXIT:-0}" # a terminal that fails: no display, not set up
 EOF
   chmod +x "$STUBS/$command"
 done
@@ -64,7 +66,7 @@ fresh_home() {
   unset CODEX_HOME
   export RESPAWN_TERMINAL=print # a test that opens tabs names its terminal, and gets a stub
   mkdir -p "$HOME/.claude/projects/p"
-  STATE="$XDG_STATE_HOME/respawn/sessions"
+  export STATE="$XDG_STATE_HOME/respawn/sessions"
 }
 
 quote() {
@@ -376,6 +378,8 @@ check "a dry run keeps the records" exists "$STATE/claude.cut-off.json"
 check "picking a session that is not listed fails" bash -c "echo 9 | '$BIN'; [ \$? -eq 2 ]"
 check "answering no reopens nothing and keeps the records" bash -c "echo n | '$BIN' && [ -e '$STATE/claude.cut-off.json' ]"
 check "an unknown terminal is refused" bash -c "'$BIN' --in nowhere -y; [ \$? -eq 2 ]"
+check "so is an option respawn does not know, wherever it is" bash -c "'$BIN' --list --bogus; [ \$? -eq 2 ]"
+check "  and two modes at once" bash -c "'$BIN' -y --list; [ \$? -eq 2 ]"
 printed=$("$BIN" --in print -y)
 check "--in print prints the commands" has "$printed" "claude --resume cut-off"
 check "and keeps the records, since nothing was reopened" exists "$STATE/claude.cut-off.json"
@@ -402,6 +406,15 @@ list=$("$BIN" --list)
 check "a session with no transcript, started 8 days ago and prompted since, is still offered" \
   bash -c "grep -qF 'still at it' <<<\"\$1\" && grep -qF 'earlier' <<<\"\$1\"" _ "$list"
 check "  and dated by its last prompt" bash -c "[ \$(grep -c ' 0m ago ' <<<\"\$1\") -eq 2 ]" _ "$list"
+fresh_home
+fake_record claude accents "$HOME/work"
+transcript accents
+long="$(printf 'x%.0s' $(seq 1 59))è e poi il resto"
+jq --arg prompt "$long" '.first_prompt = $prompt' "$STATE/claude.accents.json" >"$WORK/r" && mv "$WORK/r" "$STATE/claude.accents.json"
+list=$(LC_ALL=C "$BIN" --list)
+check "a preview is cut by characters, never inside one, whatever the locale" \
+  bash -c "printf '%s' \"\$1\" | iconv -f UTF-8 -t UTF-8 >/dev/null" _ "$list"
+check "  and keeps the character at the cut whole" has "$list" "xè"
 if [ -r /proc/self/stat ]; then
   fresh_home
   # procps computes ps's start time from the clock: once the clock is stepped (NTP), it moves
@@ -445,6 +458,13 @@ if command -v tmux >/dev/null; then
   check "and types the session's resume command" \
     bash -c "grep -qF 'claude --resume one' <<<\"\$1\" && grep -qF 'claude --resume two' <<<\"\$1\"" _ "$typed"
   check "the reopened sessions' records are cleared (each records itself again)" missing "$STATE/claude.one.json"
+  for round in first second; do
+    fake_record claude "$round" "$HOME/work/c"
+    transcript "$round"
+    out=$(env -u TMUX PATH="$WORK/agents:$PATH" "$BIN" --in tmux -y 2>&1)
+  done
+  check "outside tmux, a second reopen while the first respawn session is still there gets a session of its own" \
+    has "$out" "tmux attach -t respawn-2"
   tmux kill-server
   unset TMUX_TMPDIR
 else
@@ -523,6 +543,45 @@ check "Konsole: each tab runs a script that resumes its session" has "$(cat "$XD
 
 reopen_in x-terminal-emulator
 check "x-terminal-emulator: a window per session, folder and command as arguments" bash -c "[ \$(grep -cxF '=== x-terminal-emulator' <<<\"\$1\") -eq 2 ] && grep -qxF 'arg: $HOME/work/a b' <<<\"\$1\" && grep -qxF 'arg: claude --resume one' <<<\"\$1\"" _ "$SENT"
+
+kept_and_printed() { # the terminal failed: respawn says so, prints the commands and keeps both records
+  has "$OUT" "could not open tabs" && has "$OUT" "claude --resume one" && has "$OUT" "claude --resume two" &&
+    exists "$STATE/claude.one.json" && exists "$STATE/claude.two.json"
+}
+for terminal in gnome-terminal ptyxis konsole x-terminal-emulator; do
+  STUB_EXIT=1 reopen_in "$terminal"
+  check "$terminal failing (no display, say): the commands are printed and the records kept" kept_and_printed
+done
+if ! command -v konsole >/dev/null; then
+  mv "$STUBS/konsole" "$STUBS/konsole.off"
+  reopen_in konsole
+  mv "$STUBS/konsole.off" "$STUBS/konsole"
+  check "konsole not installed: the same" kept_and_printed
+else
+  skip "Konsole is installed here: its absence can't be tested"
+fi
+# The first tab resumed its session, which recorded itself anew, before the terminal returned (Zellij outside a
+# session runs in the foreground until you detach).
+STUB_RUN='jq ".pid = 4242" "$STATE/claude.one.json" >"$STATE/new" && mv "$STATE/new" "$STATE/claude.one.json"' reopen_in zellij
+check "a session that recorded itself again while its terminal opened keeps its new record" \
+  jq -e '.pid == 4242' "$STATE/claude.one.json"
+check "  while one that has not is forgotten" missing "$STATE/claude.two.json"
+
+fresh_home
+mkdir -p "$HOME/work/c"
+fake_record claude one "$HOME/work/c"
+transcript one
+export STUB_LOG="$WORK/sent"
+: >"$STUB_LOG"
+out=$(PATH="$STUBS:$PATH" "$BIN" -y --in kitty </dev/null 2>&1)
+check "--in is read after the mode too" has "$out" "Reopened 1 session in kitty."
+fake_record claude one "$HOME/work/c"
+: >"$STUB_LOG"
+PATH="$STUBS:$PATH" "$BIN" --in kitty </dev/null >/dev/null 2>&1
+check "the input ending at the question is a no: nothing is opened" is "$(cat "$STUB_LOG")" ""
+check "  and the record is kept" exists "$STATE/claude.one.json"
+out=$(printf 1 | PATH="$STUBS:$PATH" "$BIN" --in kitty 2>&1)
+check "  while an answer the input ends on, with no newline, still counts" has "$out" "Reopened 1 session in kitty."
 
 echo "terminals: which one respawn reopens into"
 fresh_home

@@ -49,13 +49,14 @@ are recorded on their next prompt, so there is nothing to restart. Install an ag
 | `respawn -y` | Reopen all of them without asking |
 | `respawn --list` | Only list them |
 | `respawn --dry-run` | Print the commands instead of opening anything |
-| `respawn --in kitty` | Open them in another terminal than the one you're in |
+| `respawn --in kitty` | Open them in another terminal than the one you're in (with any of the above: `respawn -y --in kitty`) |
 | `respawn --clear` | Forget the cut-off sessions (each agent still has them in its own resume list) |
 | `respawn setup` | Add the hooks to every supported agent installed here |
 | `respawn doctor` | Show the agents respawn sees, their hooks, your terminal, its records |
 | `respawn uninstall` | Remove the hooks and the records |
 
-When it asks, type `1 3` to reopen only some of them.
+When it asks, type `1 3` to reopen only some of them. If the terminal fails to open them (no display, not
+installed), respawn says so, prints the commands instead, and keeps every session for next time.
 
 ## Agents
 
@@ -91,7 +92,7 @@ respawn opens the sessions in the terminal you run it from, or the one you name 
 | Terminal | How the sessions open | Checked |
 | :- | :- | :- |
 | [Warp](https://www.warp.dev) | A window with a tab each, from a launch configuration | **Live** |
-| [tmux](https://github.com/tmux/tmux) | A window each in your session, or a new `respawn` session | **Live**, in CI on macOS and Linux |
+| [tmux](https://github.com/tmux/tmux) | A window each in your session, or a new `respawn` session (`respawn-2` if that one is still there) | **Live**, in CI on macOS and Linux |
 | [iTerm2](https://iterm2.com) | A window with a tab each (AppleScript) | Stub |
 | Terminal.app | A window each: it can't script tabs | Stub |
 | [Ghostty](https://ghostty.org) | A window with a tab each: AppleScript on macOS (1.3+), `+new-tab` on Linux | Stub |
