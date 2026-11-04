@@ -65,7 +65,10 @@ uninstall() {
 install() {
   local here
   mkdir -p "$BIN_DIR"
-  here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)
+  here="" # empty when piped from curl: there is no clone to copy from
+  if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    here=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || here=""
+  fi
   if [ -n "$here" ] && [ -f "$here/claude-restore" ]; then
     cp "$here/claude-restore" "$BIN.tmp"
   else
