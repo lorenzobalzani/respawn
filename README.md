@@ -220,7 +220,7 @@ no longer on your PATH, and nothing else.
 ## Development
 
 ```bash
-tests/test.sh                                      # 100+ tests, each against a throwaway HOME
+tests/test.sh                                      # 150+ tests, each against a throwaway HOME
 shellcheck -x respawn install.sh tests/test.sh
 ```
 
