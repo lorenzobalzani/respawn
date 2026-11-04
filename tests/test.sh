@@ -109,6 +109,7 @@ transcript() { echo '{}' >"$HOME/.claude/projects/p/$1.jsonl"; }
 
 claude_history() { jq -nc --arg id "$1" --arg d "$2" '{display: $d, pastedContents: {}, timestamp: 0, project: "/x", sessionId: $id}' >>"$HOME/.claude/history.jsonl"; }
 
+is() { [ "$1" = "$2" ]; }
 has() { grep -qF -- "$2" <<<"$1"; }
 lacks() { ! grep -qF -- "$2" <<<"$1"; }
 exists() { [ -e "$1" ]; }
@@ -228,6 +229,11 @@ hook droid start '{"session_id":"d-1","cwd":"/work/c","transcript_path":"/t/d-1.
 check "Factory Droid: Claude Code's fields" jq -e '.session_id == "d-1" and .cwd == "/work/c"' "$STATE/droid.d-1.json"
 session "$FAKES/kiro-cli" "$(hook_line kiro start '{"hook_event_name":"SessionStart","session_id":"k-1","cwd":"/work/d"}')"
 check "Kiro CLI: under its kiro-cli process" jq -e '.session_id == "k-1"' "$STATE/kiro.k-1.json"
+USER_PROMPT="split the deploy job in two" session "$FAKES/kiro-cli" "$(hook_line kiro prompt '{"session_id":"k-1","cwd":"/work/d"}')"
+check "Kiro CLI: its prompt, which it passes in USER_PROMPT" jq -e '.first_prompt == "split the deploy job in two"' "$STATE/kiro.k-1.json"
+out=$(session "$FAKES/claude" "$(hook_line claude start '{"session_id":"quiet","cwd":"/work"}');
+  $(hook_line claude prompt '{"session_id":"quiet","prompt":"hello"}'); $(hook_line claude end '{"session_id":"quiet","reason":"clear"}')")
+check "the hooks print nothing: Kiro and Copilot hand a hook's output to the model" is "$out" ""
 hook opencode start '{"session_id":"ses_2fA9xQ","cwd":"/work/e"}'
 check "OpenCode: what its plugin sends, ses_ ids included" jq -e '.session_id == "ses_2fA9xQ"' "$STATE/opencode.ses_2fA9xQ.json"
 hook claude start '{"session_id":"wrong-agent","cwd":"/work"}' >/dev/null 2>&1
@@ -386,7 +392,6 @@ fresh_home
 unset RESPAWN_TERMINAL
 detected() { env -u TMUX -u ZELLIJ -u KITTY_WINDOW_ID -u WEZTERM_PANE -u ALACRITTY_WINDOW_ID -u KONSOLE_VERSION \
   -u PTYXIS_VERSION -u GNOME_TERMINAL_SERVICE -u LC_TERMINAL -u TERM_PROGRAM -u TERM "$@" "$BIN" doctor | sed -n 's/^Terminal: //p'; }
-is() { [ "$1" = "$2" ]; }
 check "inside tmux, tmux, whatever the outer terminal" is "$(detected TMUX=/tmp/s,1,0 TERM_PROGRAM=iTerm.app)" tmux
 check "kitty by its TERM, even with another terminal's TERM_PROGRAM inherited" is "$(detected TERM=xterm-kitty TERM_PROGRAM=WarpTerminal)" kitty
 check "Warp by its TERM_PROGRAM" is "$(detected TERM_PROGRAM=WarpTerminal)" Warp

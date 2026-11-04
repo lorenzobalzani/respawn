@@ -159,6 +159,7 @@ agent_hook_fields() {
   case "$1" in
     copilot) fields='.sessionId, .cwd, "", "", .reason, .prompt' ;;
     cursor) fields='.conversation_id, (.workspace_roots[0]? // env.CURSOR_PROJECT_DIR), .transcript_path, "", .reason, .prompt' ;;
+    kiro) fields='.session_id, .cwd, "", "", .reason, (.prompt // env.USER_PROMPT)' ;; # Kiro hands the prompt over in its environment
     *) fields='.session_id, .cwd, .transcript_path, .agent_id, .reason, .prompt' ;; # Claude Code's names, which most adopted
   esac
   jq -r "[$fields] | map(. // \"\" | tostring) | .[5] |= (gsub(\"\\\\s+\"; \" \") | .[0:200]) | join(\"\\u001f\")"
