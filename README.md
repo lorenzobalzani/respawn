@@ -34,9 +34,13 @@ curl -fsSL https://raw.githubusercontent.com/lorenzobalzani/respawn/main/install
 Or from a clone: `git clone https://github.com/lorenzobalzani/respawn.git && cd respawn && ./install.sh`.
 
 The installer puts `respawn` in `~/.local/bin` and adds its hooks to every supported agent it finds. It
-changes nothing else in their settings, keeps a backup of every file it edits, leaves alone a file that isn't
-valid JSON, and adds nothing when run again. Sessions you start from then on are recorded; ones already open
-are recorded on their next prompt, so there is nothing to restart. Install an agent later? Run `respawn setup`.
+changes nothing else in their settings, keeps a backup of every file it edits, writes a settings file that is a
+symlink (stow, chezmoi) where the link points, leaves alone a file that isn't valid JSON, and adds nothing when
+run again. Sessions you start from then on are recorded; ones already open are recorded on their next prompt, so
+there is nothing to restart. Install an agent later? Run `respawn setup`.
+
+**Upgrading from claude-restore 0.1.0?** The installer takes its hooks out of Claude Code's settings, and tells you
+where its script and its records are, so that you can delete them.
 
 **Needs:** bash (the 3.2 that macOS ships is enough) and `jq` (in macOS 15 and later; otherwise
 `brew install jq` or `apt install jq`). Nothing else, and nothing ever leaves your machine.
@@ -73,7 +77,8 @@ installed), respawn says so, prints the commands instead, and keeps every sessio
 | [OpenCode](https://opencode.ai) 1.x | `opencode -s <id>` | Its source; tested with a stand-in |
 
 **Codex** runs a hook only once you approve it: after installing, open Codex, type `/hooks` and approve
-respawn's three. **OpenCode** has no command hooks, so respawn installs a small plugin instead.
+respawn's three. **OpenCode** has no command hooks, so respawn installs a small plugin instead, which hands each
+event to respawn without making OpenCode wait.
 
 "Tested with a stand-in" means the test suite runs that agent's hook flow under a fake process that carries the
 agent's name, command line, terminal and shell, the way the real one does. If an agent behaves differently on
@@ -186,7 +191,7 @@ Everything stays on your machine; respawn makes no network calls.
 | Each agent's own hooks file | The hooks, written by `respawn setup`, removed by `respawn uninstall` |
 | `~/.claude/history.jsonl` | Read, for a Claude Code session's first prompt when the hooks didn't see it |
 | `~/.local/state/respawn/` | The files kitty, Konsole and Zellij open the tabs from |
-| `~/.warp/launch_configurations/respawn.yaml` | The window Warp opens |
+| `~/.warp/launch_configurations/respawn.yaml` (macOS), `~/.local/share/warp-terminal/launch_configurations/respawn.yaml` (Linux) | The window Warp opens |
 
 ## FAQ
 
@@ -209,7 +214,8 @@ own, and are listed in `claude agents` after a restart. respawn covers the sessi
 respawn uninstall && rm ~/.local/bin/respawn
 ```
 
-Or `./install.sh --uninstall` from a clone. Either removes respawn's hooks from every agent, and nothing else.
+Or `./install.sh --uninstall` from a clone. Either removes respawn's hooks from every agent, including one that is
+no longer on your PATH, and nothing else.
 
 ## Development
 

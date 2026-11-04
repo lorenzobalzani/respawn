@@ -1,6 +1,6 @@
 #!/bin/bash
 # Tests for respawn and install.sh, each against a throwaway HOME.
-# Needs bash, jq, python3, perl and a C compiler; tmux for the tmux tests (skipped without it).
+# Needs bash, jq, python3, perl and a C compiler; tmux and node for a few tests (skipped without them).
 # Run: tests/test.sh
 # shellcheck disable=SC2016 # jq programs and the hook's command line are single-quoted on purpose
 
@@ -125,6 +125,7 @@ transcript() { echo '{}' >"$HOME/.claude/projects/p/$1.jsonl"; }
 claude_history() { jq -nc --arg id "$1" --arg d "$2" '{display: $d, pastedContents: {}, timestamp: 0, project: "/x", sessionId: $id}' >>"$HOME/.claude/history.jsonl"; }
 
 is() { [ "$1" = "$2" ]; }
+json_quote() { jq -rn --arg value "$1" '$value | @json'; }
 has() { grep -qF -- "$2" <<<"$1"; }
 lacks() { ! grep -qF -- "$2" <<<"$1"; }
 exists() { [ -e "$1" ]; }
@@ -629,7 +630,7 @@ echo '{ not json' >"$settings"
 check "a settings file that is not JSON is left as it was" bash -c "[ \"\$(cat '$settings')\" = '{ not json' ]"
 
 # Stand-ins for the agents' commands, so that setup finds them installed. Gemini CLI prints a version.
-agents_on_path() { # gemini-version
+agents_on_path() { # gemini-version [qwen-version]
   mkdir -p "$WORK/bin"
   for command in codex qwen copilot cursor-agent droid kiro-cli opencode; do
     printf '#!/bin/sh\n' >"$WORK/bin/$command"
@@ -637,9 +638,10 @@ agents_on_path() { # gemini-version
   done
   printf '#!/bin/sh\necho %s\n' "$1" >"$WORK/bin/gemini"
   chmod +x "$WORK/bin/gemini"
+  printf '#!/bin/sh\necho >>%s\necho %s\n' "$(quote "$WORK/qwen-asked")" "${2:-}" >"$WORK/bin/qwen" # already executable
 }
 fresh_home
-agents_on_path 0.22.2 # an old Gemini CLI, which runs hooks only when told to
+agents_on_path 0.22.2 0.13.0 # an old Gemini CLI, which runs hooks only when told to; a Qwen Code before hooks
 mkdir -p "$HOME/.cursor" "$HOME/.factory"
 echo '{"version":1,"hooks":{"stop":[{"command":"say done"}]}}' >"$HOME/.cursor/hooks.json"
 out=$(PATH="$WORK/bin:$PATH" "$BIN" setup)
@@ -650,6 +652,8 @@ check "Gemini CLI gets its own prompt event, BeforeAgent, with a timeout in mill
   '.hooks.BeforeAgent[0].hooks[0].timeout == 10000 and (.hooks.SessionStart | length) == 1 and (.hooks.SessionEnd | length) == 1' "$HOME/.gemini/settings.json"
 check "an old Gemini CLI also gets hooks switched on" jq -e '.tools.enableHooks == true' "$HOME/.gemini/settings.json"
 check "Qwen Code gets its hooks" jq -e '(.hooks.SessionStart | length) == 1 and .hooks.UserPromptSubmit[0].hooks[0].timeout == 10' "$HOME/.qwen/settings.json"
+check "  and a note that a Qwen Code before 0.14 runs none yet" has "$out" "Qwen Code 0.13.0 has no hooks yet"
+check "  for which setup asks it for its version once" is "$(wc -l <"$WORK/qwen-asked" | tr -d ' ')" 1
 check "Copilot CLI gets a hook file of respawn's own" jq -e --arg bin "$BIN" \
   '.version == 1 and .hooks.sessionStart[0].bash == ($bin + " hook copilot start") and .hooks.userPromptSubmitted[0].timeoutSec == 10' \
   "$HOME/.copilot/hooks/respawn.json"
@@ -664,8 +668,30 @@ check "OpenCode gets a plugin that calls this respawn" has "$(cat "$plugin" 2>/d
 if command -v node >/dev/null; then
   cp "$plugin" "$WORK/plugin.mjs" 2>/dev/null
   check "and the plugin is valid JavaScript" node --check "$WORK/plugin.mjs"
+  # OpenCode loads it: here node, under a name ps shows as opencode, in a terminal, in a shell
+  mkdir -p "$WORK/oc" "$HOME/work/oc"
+  ln -s "$(command -v node)" "$WORK/oc/opencode"
+  cat >"$WORK/load-plugin.mjs" <<'EOF'
+const [plugin, directory, id, elapsed] = process.argv.slice(2)
+const { Respawn } = await import(plugin)
+const hooks = await Respawn({ directory })
+const started = Date.now()
+await hooks.event({ event: { type: "session.created", properties: { info: { id, directory } } } })
+;(await import("node:fs")).writeFileSync(elapsed, String(Date.now() - started))
+await new Promise((resolve) => setTimeout(resolve, 1000))
+await hooks["chat.message"]({ sessionID: id }, { parts: [{ type: "text", text: "tidy the docs" }] })
+setTimeout(() => {}, 1500) // OpenCode runs on, and the hooks it started finish meanwhile
+EOF
+  session "$WORK/oc/opencode" "$WORK/load-plugin.mjs" "$WORK/plugin.mjs" "$HOME/work/oc" ses_plugin "$WORK/elapsed"
+  check "the plugin records its session from inside OpenCode, with its first prompt" \
+    jq -e '.session_id == "ses_plugin" and .first_prompt == "tidy the docs"' "$STATE/opencode.ses_plugin.json"
+  printf '#!/bin/sh\nsleep 2\n' >"$WORK/slow-respawn" # a respawn that takes its time
+  chmod +x "$WORK/slow-respawn"
+  sed "s|^const RESPAWN = .*|const RESPAWN = $(json_quote "$WORK/slow-respawn")|" "$WORK/plugin.mjs" >"$WORK/slow-plugin.mjs"
+  node "$WORK/load-plugin.mjs" "$WORK/slow-plugin.mjs" "$HOME/work/oc" ses_slow "$WORK/elapsed-slow" >/dev/null 2>&1
+  check "  and never makes OpenCode wait for respawn" bash -c "[ \$(cat '$WORK/elapsed-slow') -lt 1000 ]"
 else
-  skip "node is not installed: the OpenCode plugin is not syntax-checked"
+  skip "node is not installed: the OpenCode plugin is neither syntax-checked nor run"
 fi
 PATH="$WORK/bin:$PATH" "$BIN" uninstall >/dev/null
 check "uninstall removes respawn's own files" bash -c "[ ! -e '$HOME/.copilot/hooks/respawn.json' ] && [ ! -e '$HOME/.kiro/hooks/respawn.json' ] && [ ! -e '$plugin' ]"
@@ -691,6 +717,58 @@ PATH="$WORK/bin:$PATH" "$BIN" uninstall >/dev/null
 check "uninstall takes respawn's hooks out of every agent" bash -c "! grep -qs 'respawn hook' '$HOME/.gemini/settings.json' '$HOME/.codex/hooks.json'"
 check "a config file keeps its permissions" bash -c "[ \"\$(ls -l '$HOME/.codex/hooks.json' | cut -c1-10)\" = '-rw-r--r--' ]"
 check "and leaves the agents' own hooks" jq -e '.hooks.Stop[0].hooks[0].command == "notify-me"' "$HOME/.codex/hooks.json"
+
+fresh_home
+agents_on_path 0.66.0
+PATH="$WORK/bin:$PATH" "$BIN" setup >/dev/null
+mkdir -p "$HOME/.warp/launch_configurations" "$HOME/.local/share/warp-terminal/launch_configurations"
+touch "$HOME/.warp/launch_configurations/respawn.yaml" "$HOME/.local/share/warp-terminal/launch_configurations/respawn.yaml"
+"$BIN" uninstall >/dev/null # the agents are not on PATH: removed since, or installed with nvm
+no_hooks_left() {
+  local file
+  for file in "$HOME/.codex/hooks.json" "$HOME/.gemini/settings.json" "$HOME/.qwen/settings.json" \
+    "$HOME/.factory/settings.json" "$HOME/.cursor/hooks.json" "$HOME/.claude/settings.json"; do
+    if grep -qs 'respawn.* hook ' "$file"; then return 1; fi
+  done
+  missing "$HOME/.copilot/hooks/respawn.json" && missing "$HOME/.kiro/hooks/respawn.json" &&
+    missing "$HOME/.config/opencode/plugins/respawn.js"
+}
+check "uninstall takes the hooks out of every agent, on PATH or not" no_hooks_left
+check "  and Warp's launch configuration, where macOS and Linux keep it" \
+  bash -c "[ ! -e '$HOME/.warp/launch_configurations/respawn.yaml' ] && [ ! -e '$HOME/.local/share/warp-terminal/launch_configurations/respawn.yaml' ]"
+
+fresh_home
+mkdir -p "$WORK/dotfiles"
+echo '{"model": "opus"}' >"$WORK/dotfiles/claude.json"
+chmod 640 "$WORK/dotfiles/claude.json"
+ln -s ../../dotfiles/claude.json "$HOME/.claude/settings.json" # as stow links it
+"$BIN" setup >/dev/null
+check "a settings file that is a symlink (stow, chezmoi) stays one" test -L "$HOME/.claude/settings.json"
+check "  and the file it points to gets the hooks, with its permissions" \
+  bash -c "jq -e '.model == \"opus\" and (.hooks.SessionStart | length) == 1' '$WORK/dotfiles/claude.json' >/dev/null && [ \"\$(ls -l '$WORK/dotfiles/claude.json' | cut -c1-10)\" = '-rw-r-----' ]"
+"$BIN" uninstall >/dev/null
+check "  as it does on uninstall" bash -c "[ -L '$HOME/.claude/settings.json' ] && jq -e '.hooks == null' '$WORK/dotfiles/claude.json' >/dev/null"
+
+fresh_home
+mkdir -p "$HOME/.local/bin" "$HOME/.claude/session-restore"
+printf '#!/bin/sh\n' >"$HOME/.local/bin/claude-restore"
+legacy_settings() { # claude-restore 0.1.0's three hooks, next to one of the user's own
+  jq -n --arg bin "$HOME/.local/bin/claude-restore" '{hooks: {
+    SessionStart: [{hooks: [{type: "command", command: ($bin + " record"), timeout: 10}]}],
+    UserPromptSubmit: [{hooks: [{type: "command", command: ($bin + " record-once"), timeout: 10}]}],
+    SessionEnd: [{hooks: [{type: "command", command: ($bin + " forget")}]}],
+    Stop: [{hooks: [{type: "command", command: "say done"}]}]}}' >"$HOME/.claude/settings.json"
+}
+legacy_settings
+out=$("$BIN" setup)
+check "setup takes out the hooks of claude-restore 0.1.0, which respawn replaces" \
+  bash -c "! grep -qE 'claude-restore (record|record-once|forget)' '$HOME/.claude/settings.json'"
+check "  keeps the user's own and adds respawn's" \
+  jq -e '.hooks.Stop[0].hooks[0].command == "say done" and ([.hooks.SessionStart, .hooks.UserPromptSubmit, .hooks.SessionEnd] | map(length) == [1, 1, 1])' "$HOME/.claude/settings.json"
+check "  and says what claude-restore left behind" has "$out" "rm -f $HOME/.local/bin/claude-restore && rm -rf ~/.claude/session-restore"
+legacy_settings
+"$BIN" uninstall >/dev/null
+check "uninstall takes them out too" jq -e '.hooks | keys == ["Stop"]' "$HOME/.claude/settings.json"
 
 echo "installer"
 fresh_home

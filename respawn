@@ -36,6 +36,8 @@ SETTLE_SECONDS=30      # how long an agent may take to exit after its end hook (
 SHELL_GRACE_SECONDS=2  # how long a closing terminal's shell may outlive its agent (zsh saves its history)
 LAUNCH_CHECK_SECONDS=1 # how soon a terminal started in the background has failed, if it fails
 SEP=$'\x1f'            # field separator: not whitespace, so an empty field stays a field
+RESPAWN_HOOK="respawn'? hook "                               # what a hook respawn wrote runs
+LEGACY_HOOK='claude-restore (record|record-once|forget)$' # the hooks of claude-restore 0.1.0, which respawn replaces
 
 say() { printf '%s\n' "$*"; }
 plural() { if [ "$1" = 1 ]; then echo "$2"; else echo "${2}s"; fi; }
@@ -61,30 +63,42 @@ shell_quote() { # quoted only when it has to be
 
 json_string() { jq -rn --arg value "$1" '$value | @json'; }
 
-# Rewrite a JSON config through jq, refusing to write anything that is not JSON.
-# Returns 1 when nothing changed.
+# Where a path finally points, through any symlinks.
+link_target() {
+  local path=$1 link n=0
+  while [ -L "$path" ] && [ "$n" -lt 40 ]; do
+    link=$(readlink "$path")
+    case "$link" in /*) path=$link ;; *) path="$(dirname "$path")/$link" ;; esac
+    n=$((n + 1))
+  done
+  printf '%s\n' "$path"
+}
+
+# Rewrite a JSON config through jq, refusing to write anything that is not JSON. A config that is a symlink
+# (stow, chezmoi) is written where it points, so that it stays a link. Returns 1 when nothing changed.
 edit_json() {
-  local file=$1 filter=$2 tmp
+  local file=$1 filter=$2 target tmp
   shift 2
-  mkdir -p "$(dirname "$file")"
-  [ -s "$file" ] || echo '{}' >"$file"
-  if ! jq -e . "$file" >/dev/null 2>&1; then
+  target=$(link_target "$file")
+  mkdir -p "$(dirname "$target")"
+  [ -s "$target" ] || echo '{}' >"$target"
+  if ! jq -e . "$target" >/dev/null 2>&1; then
     warn "$file is not valid JSON; left it alone"
     return 2
   fi
-  tmp=$(mktemp "$file.XXXXXX")
-  if ! jq "$@" "$filter" "$file" >"$tmp" || ! jq -e . "$tmp" >/dev/null; then
+  tmp=$(mktemp "$target.XXXXXX")
+  if ! jq "$@" "$filter" "$target" >"$tmp" || ! jq -e . "$tmp" >/dev/null; then
     rm -f "$tmp"
     warn "could not update $file"
     return 2
   fi
-  if cmp -s "$tmp" "$file"; then
+  if cmp -s "$tmp" "$target"; then
     rm -f "$tmp"
     return 1
   fi
-  cp -p "$file" "$file.bak-respawn"
-  chmod "$(file_mode "$file")" "$tmp" # mktemp makes it 600: keep the file's own permissions
-  mv "$tmp" "$file"
+  cp -p "$target" "$file.bak-respawn"
+  chmod "$(file_mode "$target")" "$tmp" # mktemp makes it 600: keep the file's own permissions
+  mv "$tmp" "$target"
 }
 
 file_mode() { if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi; }
@@ -215,6 +229,14 @@ agent_hooks_file() {
   esac
 }
 
+# Every file the agent's hooks may be in, one per line, whether it exists or not.
+agent_hooks_files() {
+  case "$1" in
+    droid) printf '%s\n' "$(agent_home droid)/hooks.json" "$(agent_home droid)/settings.json" ;;
+    *) agent_hooks_file "$1" ;;
+  esac
+}
+
 agent_setup_note() {
   local version
   case "$1" in
@@ -240,31 +262,33 @@ version_below() { # is version $1 below $2? (major.minor)
 
 hook_command() { echo "$(shell_quote "$1") hook $2 $3"; } # bin agent event
 
-# Adds (setup) or removes (unsetup) respawn's hooks in the agent's own config. Returns 1 when nothing changed.
+# Adds (setup) or removes (unsetup) respawn's hooks in one of the agent's config files. Returns 1 when nothing
+# changed. Removing never creates a file.
 agent_hooks() {
-  local action=$1 agent=$2 bin=$3 file
-  file=$(agent_hooks_file "$agent")
+  local action=$1 agent=$2 bin=$3 file=$4
+  if [ "$action" = unsetup ] && [ ! -s "$file" ]; then return 1; fi
   case "$agent" in
     copilot | kiro | opencode) # a file of respawn's own
       if [ "$action" = unsetup ]; then
-        [ -f "$file" ] || return 1
         rm -f "$file"
         return 0
       fi
-      mkdir -p "$(dirname "$file")"
-      local tmp
-      tmp=$(mktemp "$file.XXXXXX")
+      local target tmp
+      target=$(link_target "$file")
+      mkdir -p "$(dirname "$target")"
+      tmp=$(mktemp "$target.XXXXXX")
       own_hooks_file "$agent" "$bin" >"$tmp"
-      if [ -f "$file" ] && cmp -s "$tmp" "$file"; then
+      if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
         rm -f "$tmp"
         return 1
       fi
       chmod 644 "$tmp"
-      mv "$tmp" "$file"
+      mv "$tmp" "$target"
       ;;
     cursor)
       if [ "$action" = unsetup ]; then
-        edit_json "$file" '.hooks |= (if . == null then . else map_values(map(select((.command // "") | test("respawn'"'"'? hook ") | not))) | with_entries(select(.value | length > 0)) end)'
+        edit_json "$file" '.hooks |= (if . == null then . else map_values(map(select((.command // "") | test($pattern) | not))) | with_entries(select(.value | length > 0)) end)' \
+          --arg pattern "$RESPAWN_HOOK"
         return
       fi
       edit_json "$file" '
@@ -286,9 +310,9 @@ agent_hooks_like_claude() {
   local extra='{"timeout":10}' path='.hooks' version enable='.'
   if [ "$action" = unsetup ]; then
     if [ "$agent" = droid ] && [ "$(basename "$file")" = hooks.json ]; then
-      edit_json "$file" "$(unhook_filter top)"
+      edit_json "$file" "$(unhook_filter top)" --arg pattern "$RESPAWN_HOOK"
     else
-      edit_json "$file" "$(unhook_filter)"
+      edit_json "$file" "$(unhook_filter)" --arg pattern "$RESPAWN_HOOK"
     fi
     return
   fi
@@ -339,17 +363,21 @@ own_hooks_file() {
 // respawn: records this OpenCode session, so that \`respawn\` can reopen it after your terminal goes away.
 // Written by \`respawn setup\`; \`respawn uninstall\` removes it. OpenCode has no end event: respawn tells a
 // closed terminal from a quit by whether the session's shell is still there.
-import { spawnSync } from "node:child_process"
+import { spawn } from "node:child_process"
 
 const RESPAWN = $(json_string "$bin")
 
+// Hands the event to respawn and returns at once: OpenCode never waits for it.
 function send(event, payload) {
   try {
-    spawnSync(RESPAWN, ["hook", "opencode", event], {
-      input: JSON.stringify(payload),
-      stdio: ["pipe", "ignore", "ignore"],
-      timeout: 5000,
-    })
+    const child = spawn(RESPAWN, ["hook", "opencode", event], { stdio: ["pipe", "ignore", "ignore"] })
+    const timer = setTimeout(() => child.kill(), 5000)
+    timer.unref?.()
+    child.on("error", () => clearTimeout(timer))
+    child.on("exit", () => clearTimeout(timer))
+    child.stdin.on("error", () => {})
+    child.stdin.end(JSON.stringify(payload))
+    child.unref()
   } catch {}
 }
 
@@ -377,19 +405,35 @@ agent_hooked() {
   [ -f "$file" ] && grep -q "hook $1 " "$file" && grep -q respawn "$file"
 }
 
-# jq filter dropping every hook whose command runs `respawn hook`, then any group or event left empty.
+# jq filter dropping every hook whose command matches $pattern, then any group or event left empty.
 # Only the events are touched: under "hooks", or, with "top", at the top of a file of nothing but events
 # (Factory Droid's hooks.json).
 unhook_filter() {
   local clean='map_values(if type == "array" then
         map(if type == "object" and (.hooks | type) == "array"
-            then .hooks |= map(select((.command // "") | test("respawn'"'"'? hook ") | not)) else . end)
+            then .hooks |= map(select((.command // "") | test($pattern) | not)) else . end)
         | map(select(type != "object" or (.hooks | type) != "array" or (.hooks | length) > 0))
       else . end) | with_entries(select((.value | type) != "array" or (.value | length) > 0))'
   if [ "${1:-}" = top ]; then
     printf '%s' "$clean"
   else
     printf 'if (.hooks | type) == "object" then .hooks |= (%s) | if .hooks == {} then del(.hooks) else . end else . end' "$clean"
+  fi
+}
+
+# claude-restore 0.1.0, which respawn replaces, kept its hooks in Claude Code's settings: take them out, so
+# that the two don't both run, and say what it left behind.
+forget_claude_restore() {
+  local settings="$HOME/.claude/settings.json" script
+  [ -s "$settings" ] || return 0
+  script=$(jq -r --arg pattern "$LEGACY_HOOK" \
+    '[.. | objects | .command? | strings | select(test($pattern)) | sub(" (record|record-once|forget)$"; "")] | first // empty' \
+    "$settings" 2>/dev/null)
+  [ -n "$script" ] || return 0
+  edit_json "$settings" "$(unhook_filter)" --arg pattern "$LEGACY_HOOK" || return 0
+  say "  claude-restore 0.1.0, which respawn replaces: its hooks removed from $settings"
+  if [ -e "$script" ] || [ -d "$HOME/.claude/session-restore" ]; then
+    say "    What it left, which nothing uses now: rm -f $(shell_quote "$script") && rm -rf ~/.claude/session-restore"
   fi
 }
 
@@ -1204,28 +1248,39 @@ restore() {
 this_script() { echo "$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"; }
 
 setup() {
-  local action=$1 bin agent result any=0
+  local bin agent result note any=0
   bin=$(this_script)
+  forget_claude_restore
   for agent in $AGENTS; do
     agent_installed "$agent" || continue
     any=1
-    agent_hooks "$action" "$agent" "$bin"
+    agent_hooks setup "$agent" "$bin" "$(agent_hooks_file "$agent")"
     result=$?
-    case "$action:$result" in
-      setup:0 | setup:1)
-        if [ "$result" = 0 ]; then
-          say "  $(agent_label "$agent"): hooks added to $(agent_hooks_file "$agent")"
-        else
-          say "  $(agent_label "$agent"): hooks already there"
-        fi
-        if [ -n "$(agent_setup_note "$agent")" ]; then say "    $(agent_setup_note "$agent")"; fi
+    case "$result" in
+      0) say "  $(agent_label "$agent"): hooks added to $(agent_hooks_file "$agent")" ;;
+      1) say "  $(agent_label "$agent"): hooks already there" ;;
+      *)
+        say "  $(agent_label "$agent"): skipped (see above)"
+        continue
         ;;
-      unsetup:0) say "  $(agent_label "$agent"): hooks removed from $(agent_hooks_file "$agent")" ;;
-      unsetup:1) ;;
-      *) say "  $(agent_label "$agent"): skipped (see above)" ;;
     esac
+    note=$(agent_setup_note "$agent")
+    if [ -n "$note" ]; then say "    $note"; fi
   done
   [ "$any" = 1 ] || say "  No supported agent found. Install one, then run: respawn setup"
+}
+
+# Every agent's hooks out of every file they may be in, whether the agent is still on PATH or not: a hook
+# left behind would run a respawn that is gone.
+unsetup() {
+  local bin agent file
+  bin=$(this_script)
+  forget_claude_restore
+  for agent in $AGENTS; do
+    while IFS= read -r file; do
+      if agent_hooks unsetup "$agent" "$bin" "$file"; then say "  $(agent_label "$agent"): hooks removed from $file"; fi
+    done < <(agent_hooks_files "$agent")
+  done
 }
 
 doctor() {
@@ -1288,10 +1343,12 @@ main() {
   [ -n "$terminal" ] || terminal=$(detect_terminal)
   case "${mode:-ask}" in
     ask | all | list | dry | clear) restore "${mode:-ask}" "$terminal" ;;
-    setup) setup setup ;;
+    setup) setup ;;
     uninstall)
-      setup unsetup
-      rm -rf "$STATE_DIR" "$HOME/.warp/launch_configurations/respawn.yaml"
+      unsetup
+      rm -rf "$STATE_DIR"
+      rm -f "$HOME/.warp/launch_configurations/respawn.yaml" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/warp-terminal/launch_configurations/respawn.yaml"
       say "Removed respawn's hooks and records."
       ;;
     doctor) doctor ;;
