@@ -1,0 +1,226 @@
+#!/bin/bash
+# claude-restore: reopen the Claude Code sessions that quitting Warp or
+# restarting the Mac cut off, each in its own tab of a new Warp window.
+#
+# Three Claude Code hooks keep a record of every interactive session:
+#   SessionStart       claude-restore record        session id, folder, the claude process running it
+#   UserPromptSubmit   claude-restore record-once   the same, if not recorded yet
+#   SessionEnd         claude-restore forget        only when you left on purpose:
+#                                                   /exit, /clear, /resume, logout
+# A recorded session whose claude process no longer runs was cut off.
+#
+# Usage:
+#   claude-restore             list the cut-off sessions, ask, reopen them in a new Warp window
+#   claude-restore -y          reopen all of them without asking
+#   claude-restore --list      only list them
+#   claude-restore --dry-run   print the Warp launch configuration instead of opening it
+#   claude-restore --clear     forget every cut-off session without reopening it
+#   claude-restore --version
+
+set -u
+
+VERSION="0.1.0"
+STATE_DIR="$HOME/.claude/session-restore/open"
+HISTORY_FILE="$HOME/.claude/history.jsonl"
+LAUNCH_DIR="$HOME/.warp/launch_configurations"
+LAUNCH_NAME="claude-restore" # the file name and the name: inside it, kept equal
+MAX_AGE_DAYS=7               # a session cut off longer ago than this is dropped rather than offered
+PROMPT_PREVIEW_CHARS=70
+PATH_PREVIEW_CHARS=30
+SEP=$'\x1f' # field separator: not whitespace, so an empty field stays a field
+
+# ---------- the hooks ----------
+
+started_at() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+
+is_claude() {
+  local name
+  name=$(ps -ww -o comm= -p "$1" 2>/dev/null) || return 1 # -ww: BSD ps cuts a long path at 80 columns
+  name=${name##*/}
+  [ "$name" = claude ] && return 0
+  [ "$name" = node ] || return 1 # an npm install runs as node .../claude-code/cli.js
+  case "$(ps -ww -o args= -p "$1" 2>/dev/null)" in *claude-code* | */claude | */claude\ *) return 0 ;; esac
+  return 1
+}
+
+# The claude process running this hook: the nearest ancestor that is claude.
+claude_pid() {
+  local pid=$PPID _
+  for _ in 1 2 3 4 5 6; do
+    [ "$pid" -gt 1 ] 2>/dev/null || return 1
+    if is_claude "$pid"; then
+      echo "$pid"
+      return 0
+    fi
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+
+valid_id() { case "$1" in '' | *[!A-Za-z0-9-]*) return 1 ;; esac }
+
+# record: always (re)write, at SessionStart. record-once: only if missing, on every prompt,
+# so a session already running when the hooks were installed is recorded on its next prompt.
+record() {
+  local when=$1 id cwd transcript agent pid tty
+  IFS=$SEP read -r id cwd transcript agent < <(jq -r '[.session_id // "", .cwd // "", .transcript_path // "", .agent_id // ""] | join("\u001f")')
+  valid_id "$id" && [ -n "$cwd" ] || return 0
+  [ -z "$agent" ] || return 0 # a subagent or teammate is not a session to reopen
+  [ "$when" = once ] && [ -f "$STATE_DIR/$id.json" ] && return 0
+  pid=$(claude_pid) || return 0
+  tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$tty" in '' | '?' | '??') return 0 ;; esac # claude -p, the SDK and background sessions have no terminal
+  mkdir -p "$STATE_DIR"
+  jq -n --arg id "$id" --arg cwd "$cwd" --arg transcript "$transcript" \
+    --argjson pid "$pid" --arg started "$(started_at "$pid")" --arg tty "$tty" \
+    '{session_id: $id, cwd: $cwd, transcript_path: $transcript, pid: $pid, process_started: $started, tty: $tty}' \
+    >"$STATE_DIR/$id.json.$$" && mv "$STATE_DIR/$id.json.$$" "$STATE_DIR/$id.json"
+}
+
+forget() {
+  local id reason
+  IFS=$SEP read -r id reason < <(jq -r '[.session_id // "", .reason // ""] | join("\u001f")')
+  valid_id "$id" || return 0
+  case "$reason" in
+    prompt_input_exit | clear | resume | logout) rm -f "$STATE_DIR/$id.json" ;;
+      # "other" includes the terminal going away: keep the record, that session was cut off
+  esac
+}
+
+# ---------- restoring ----------
+
+modified_at() {
+  if [ "$(uname)" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi
+}
+
+# One line per cut-off session, newest first: id, cwd, last activity (epoch), first prompt.
+cut_off_sessions() {
+  local file id cwd transcript pid started mtime prompt now
+  now=$(date +%s)
+  for file in "$STATE_DIR"/*.json; do
+    [ -e "$file" ] || continue
+    IFS=$SEP read -r id cwd transcript pid started < <(jq -r '[.session_id, .cwd, .transcript_path, (.pid | tostring), .process_started] | join("\u001f")' "$file")
+    [ "$(started_at "$pid")" = "$started" ] && continue # still running
+    if [ ! -f "$transcript" ]; then # never got a message: nothing to resume
+      rm -f "$file"
+      continue
+    fi
+    mtime=$(modified_at "$transcript")
+    if [ $((now - mtime)) -gt $((MAX_AGE_DAYS * 86400)) ]; then
+      rm -f "$file"
+      continue
+    fi
+    # what the session was about: its first prompt that is not a slash command
+    prompt=$(grep -F "\"sessionId\":\"$id\"" "$HISTORY_FILE" 2>/dev/null |
+      jq -js --argjson max "$PROMPT_PREVIEW_CHARS" \
+        'map(.display // "") | ((map(select(startswith("/") | not)) | first) // last // "") | gsub("\\s+"; " ") | .[0:$max]' 2>/dev/null)
+    printf '%s\x1f%s\x1f%s\x1f%s\n' "$id" "$cwd" "$mtime" "$prompt"
+  done | sort -t "$SEP" -k3,3nr
+}
+
+ago() {
+  local seconds=$(($(date +%s) - $1))
+  if [ "$seconds" -lt 3600 ]; then
+    echo "$((seconds / 60))m ago"
+  elif [ "$seconds" -lt 86400 ]; then
+    echo "$((seconds / 3600))h ago"
+  else
+    echo "$((seconds / 86400))d ago"
+  fi
+}
+
+short_path() {
+  local path=${1/#$HOME/\~}
+  if [ "${#path}" -gt "$PATH_PREVIEW_CHARS" ]; then
+    path="...${path: -$((PATH_PREVIEW_CHARS - 3))}"
+  fi
+  echo "$path"
+}
+
+json_string() { jq -rn --arg value "$1" '$value | @json'; }
+
+restore() {
+  local mode=$1 sessions count selected answer n line id cwd mtime prompt yaml ids="" i=0
+  sessions=$(cut_off_sessions)
+  if [ -z "$sessions" ]; then
+    echo "No cut-off Claude sessions."
+    return 0
+  fi
+  count=$(printf '%s\n' "$sessions" | wc -l | tr -d ' ')
+
+  if [ "$mode" = clear ]; then
+    while IFS=$SEP read -r id _; do rm -f "$STATE_DIR/$id.json"; done <<<"$sessions"
+    echo "Forgot $count cut-off session(s). They are still in claude --resume."
+    return 0
+  fi
+
+  echo "$count Claude session(s) were cut off:"
+  while IFS=$SEP read -r id cwd mtime prompt; do
+    i=$((i + 1))
+    printf '  %2d. %-*s %8s  %s\n' "$i" "$PATH_PREVIEW_CHARS" "$(short_path "$cwd")" "$(ago "$mtime")" "${prompt:-(no prompt)}"
+  done <<<"$sessions"
+  [ "$mode" = list ] && return 0
+
+  selected=$(seq 1 "$count")
+  if [ "$mode" = ask ]; then
+    printf 'Reopen them in a new Warp window? [Y/n, or numbers like "1 3"] '
+    read -r answer
+    case "$answer" in
+      '' | y | Y | yes) ;;
+      n | N | no) return 0 ;;
+      *) selected=$(echo "$answer" | tr ',' ' ') ;;
+    esac
+  fi
+
+  yaml="---
+name: $LAUNCH_NAME
+windows:
+  - tabs:"
+  for n in $selected; do
+    case "$n" in '' | *[!0-9]*) echo "not a number: $n" >&2; return 2 ;; esac
+    if [ "$n" -lt 1 ] || [ "$n" -gt "$count" ]; then
+      echo "no session $n" >&2
+      return 2
+    fi
+    line=$(printf '%s\n' "$sessions" | sed -n "${n}p")
+    IFS=$SEP read -r id cwd mtime prompt <<<"$line"
+    [ -d "$cwd" ] || cwd=$HOME # its folder is gone (a removed worktree): claude finds the session by id
+    yaml+="
+      - title: $(json_string "${cwd##*/}")
+        layout:
+          cwd: $(json_string "$cwd")
+          commands:
+            - exec: $(json_string "claude --resume $id")"
+    ids+=" $id"
+  done
+
+  if [ "$mode" = dry ]; then
+    printf '%s\n' "$yaml"
+    return 0
+  fi
+  if [ "$(uname)" != Darwin ]; then
+    echo "Opening Warp tabs is macOS-only for now; run claude-restore --dry-run and resume by hand." >&2
+    return 1
+  fi
+  mkdir -p "$LAUNCH_DIR"
+  printf '%s\n' "$yaml" >"$LAUNCH_DIR/$LAUNCH_NAME.yaml"
+  open "warp://launch/$LAUNCH_NAME" || return 1 # Warp finds a launch configuration by its name, not its file
+  for id in $ids; do
+    rm -f "$STATE_DIR/$id.json" # each tab records its session again as it starts
+  done
+}
+
+case "${1:-}" in
+  # the hook modes never fail: a broken record must not get in the way of a session
+  record) record always; exit 0 ;;
+  record-once) record once; exit 0 ;;
+  forget) forget; exit 0 ;;
+  '') restore ask ;;
+  -y | --yes) restore all ;;
+  -l | --list) restore list ;;
+  -n | --dry-run) restore dry ;;
+  --clear) restore clear ;;
+  -v | --version) echo "claude-restore $VERSION" ;;
+  -h | --help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" ;;
+  *) echo "unknown option: $1 (see claude-restore --help)" >&2; exit 2 ;;
+esac
