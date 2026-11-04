@@ -60,7 +60,8 @@ done
 
 fresh_home() {
   WORK=$(mktemp -d)
-  export HOME="$WORK/home" XDG_STATE_HOME="$WORK/state"
+  export HOME="$WORK/home" XDG_STATE_HOME="$WORK/state" XDG_CONFIG_HOME="$WORK/home/.config" XDG_DATA_HOME="$WORK/home/.local/share"
+  unset CODEX_HOME
   export RESPAWN_TERMINAL=print # a test that opens tabs names its terminal, and gets a stub
   mkdir -p "$HOME/.claude/projects/p"
   STATE="$XDG_STATE_HOME/respawn/sessions"
@@ -164,7 +165,7 @@ codex_hook() { printf '%s' "$2" | "$BIN" hook codex "$1"; } # from no Codex proc
 sleep 0.7
 codex_hook start "{\"session_id\":\"c-1\",\"cwd\":\"$HOME/work/web\"}"
 check "the session is matched to the Codex window open in its folder" \
-  bash -c "ps -ww -o comm= -p \$(jq .pid '$STATE/codex.c-1.json') | grep -q '/codex\$'"
+  bash -c "ps -ww -o comm= -p \$(jq .pid '$STATE/codex.c-1.json') | grep -qE '(^|/)codex\$'"
 codex_hook start "{\"session_id\":\"c-2\",\"cwd\":\"$HOME/work/api\"}"
 check "no Codex window in its folder, no record" missing "$STATE/codex.c-2.json"
 codex_hook end '{"session_id":"c-1","reason":"other"}'
@@ -192,7 +193,13 @@ echo "hooks: Gemini CLI (one node process under another)"
 fresh_home
 cat >"$WORK/inner.sh" <<EOF
 $(hook_line gemini start '{"session_id":"g-1","cwd":"/work/infra","transcript_path":"/t/g-1.json"}')
-echo \$PPID \$(ps -o ppid= -p \$PPID) >"$WORK/pids"
+# the two node processes above this script, nearest first, whether or not a shell sits between them
+p=\$\$; nodes=""
+while [ "\$p" -gt 1 ] && [ \$(echo \$nodes | wc -w) -lt 2 ]; do
+  case "\$(ps -o comm= -p \$p)" in *node) nodes="\$nodes \$p" ;; esac
+  p=\$(ps -o ppid= -p \$p | tr -d ' ')
+done
+echo \$nodes >"$WORK/pids"
 EOF
 chmod +x "$WORK/inner.sh"
 session "$FAKES/node" /opt/lib/gemini-cli/gemini "exec $(quote "$FAKES/node") /opt/lib/gemini-cli/gemini --relaunched $(quote "$WORK/inner.sh")"
@@ -288,7 +295,9 @@ if command -v tmux >/dev/null; then
   TMUX=$(tmux display-message -p '#{socket_path},#{pid},0') "$BIN" --in tmux -y >/dev/null
   sleep 1
   paths=$(tmux list-windows -t respawn-test -F '#{pane_current_path}')
-  check "a tmux window opens in each session's folder, spaces and all" bash -c "grep -qx '$HOME/work/a b' <<<'$paths' && grep -qx '$HOME/work/c' <<<'$paths'"
+  a_b=$(cd "$HOME/work/a b" && pwd -P)
+  c=$(cd "$HOME/work/c" && pwd -P)
+  check "a tmux window opens in each session's folder, spaces and all" bash -c "grep -qxF \"\$1\" <<<\"\$3\" && grep -qxF \"\$2\" <<<\"\$3\"" _ "$a_b" "$c" "$paths"
   typed=$(for w in $(tmux list-windows -t respawn-test -F '#{window_id}'); do tmux capture-pane -p -t "$w"; done)
   check "and types the session's resume command" bash -c "grep -qF 'claude --resume one' <<<'$typed' && grep -qF 'claude --resume two' <<<'$typed'"
   check "the reopened sessions' records are cleared (each records itself again)" missing "$STATE/claude.one.json"

@@ -453,8 +453,9 @@ agent_pid_by_cwd() {
     case "${name##*/}" in "$(agent_binary "$agent")" | node | bun) ;; *) continue ;; esac # cheap, before asking ps
     is_agent_pid "$agent" "$pid" || continue
     cwd=$(process_cwd "$pid")
-    [ -n "$cwd" ] && [ "$(cd "$cwd" 2>/dev/null && pwd -P)" = "$real" ] || continue
-    grep -qs "\"pid\": $pid," "$RECORDS/$agent".*.json && continue
+    [ -n "$cwd" ] || continue
+    [ "$(cd "$cwd" 2>/dev/null && pwd -P)" = "$real" ] || continue
+    if grep -qs "\"pid\": $pid," "$RECORDS/$agent".*.json; then continue; fi # another of its sessions
     found=$pid
   done < <(ps -A -ww -o pid=,tty=,comm= | sort -n)
   [ -n "$found" ] && echo "$found"
