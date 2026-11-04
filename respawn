@@ -1,0 +1,1083 @@
+#!/bin/bash
+# respawn: reopen every coding-agent session that quitting your terminal or
+# restarting your machine cut off, each resumed in its own tab.
+# https://github.com/lorenzobalzani/respawn
+#
+# Each agent's hooks keep a record of its interactive sessions:
+#   respawn hook <agent> start    the session id, its folder, the agent process running it
+#   respawn hook <agent> prompt   the same, if it is not recorded yet
+#   respawn hook <agent> end      forget it, when you left on purpose (/exit, /clear, ...)
+# A recorded session whose agent process no longer runs was cut off.
+#
+# Usage:
+#   respawn                  list the cut-off sessions, ask, reopen them in new tabs
+#   respawn -y               reopen all of them without asking
+#   respawn --list           only list them
+#   respawn --dry-run        print the commands instead of opening anything
+#   respawn --clear          forget the cut-off sessions without reopening them
+#   respawn --in <terminal>  open them in <terminal> instead of the one you are in
+#   respawn setup            add the hooks to every supported agent installed here
+#   respawn uninstall        remove the hooks and the records
+#   respawn doctor           show what respawn sees: agents, hooks, terminal, records
+#   respawn --version
+
+# shellcheck disable=SC2016 # jq programs and AppleScript are single-quoted on purpose
+
+set -u
+
+VERSION="0.2.0"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/respawn"
+RECORDS="$STATE_DIR/sessions"
+MAX_AGE_DAYS=7 # a session cut off longer ago than this is dropped rather than offered
+PREVIEW_CHARS=60
+PATH_CHARS=28
+ANCESTOR_DEPTH=8
+SEP=$'\x1f' # field separator: not whitespace, so an empty field stays a field
+
+say() { printf '%s\n' "$*"; }
+plural() { if [ "$1" = 1 ]; then echo "$2"; else echo "${2}s"; fi; }
+warn() { printf 'respawn: %s\n' "$*" >&2; }
+
+# ---------- small helpers ----------
+
+valid_id() { case "$1" in '' | *[!A-Za-z0-9._-]* | .*) return 1 ;; esac }
+
+started_at() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+
+modified_at() {
+  if [ "$(uname)" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi
+}
+
+shell_quote() { # quoted only when it has to be
+  case "$1" in
+    '' | *[!A-Za-z0-9_./:=@%+,-]*)
+      local quote="'" escaped="'\\''"
+      printf "'%s'" "${1//$quote/$escaped}"
+      ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+json_string() { jq -rn --arg value "$1" '$value | @json'; }
+
+# Rewrite a JSON config through jq, refusing to write anything that is not JSON.
+# Returns 1 when nothing changed.
+edit_json() {
+  local file=$1 filter=$2 tmp
+  shift 2
+  mkdir -p "$(dirname "$file")"
+  [ -s "$file" ] || echo '{}' >"$file"
+  if ! jq -e . "$file" >/dev/null 2>&1; then
+    warn "$file is not valid JSON; left it alone"
+    return 2
+  fi
+  tmp=$(mktemp "$file.XXXXXX")
+  if ! jq "$@" "$filter" "$file" >"$tmp" || ! jq -e . "$tmp" >/dev/null; then
+    rm -f "$tmp"
+    warn "could not update $file"
+    return 2
+  fi
+  if cmp -s "$tmp" "$file"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  cp -p "$file" "$file.bak-respawn"
+  chmod "$(file_mode "$file")" "$tmp" # mktemp makes it 600: keep the file's own permissions
+  mv "$tmp" "$file"
+}
+
+file_mode() { if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1"; else stat -c %a "$1"; fi; }
+
+# ---------- agents ----------
+# Each agent answers a few questions through the functions below, keyed by its name.
+
+AGENTS="claude codex gemini copilot cursor qwen droid kiro opencode"
+
+agent_label() {
+  case "$1" in
+    claude) echo "Claude Code" ;;
+    codex) echo "Codex" ;;
+    gemini) echo "Gemini CLI" ;;
+    copilot) echo "Copilot CLI" ;;
+    cursor) echo "Cursor CLI" ;;
+    qwen) echo "Qwen Code" ;;
+    droid) echo "Factory Droid" ;;
+    kiro) echo "Kiro CLI" ;;
+    opencode) echo "OpenCode" ;;
+  esac
+}
+
+agent_binary() {
+  case "$1" in
+    cursor) echo cursor-agent ;;
+    kiro) echo kiro-cli ;;
+    *) echo "$1" ;;
+  esac
+}
+
+agent_home() {
+  case "$1" in
+    claude) echo "$HOME/.claude" ;;
+    codex) echo "${CODEX_HOME:-$HOME/.codex}" ;;
+    gemini) echo "$HOME/.gemini" ;;
+    copilot) echo "$HOME/.copilot" ;;
+    cursor) echo "$HOME/.cursor" ;;
+    qwen) echo "$HOME/.qwen" ;;
+    droid) echo "$HOME/.factory" ;;
+    kiro) echo "$HOME/.kiro" ;;
+    opencode) echo "${XDG_CONFIG_HOME:-$HOME/.config}/opencode" ;;
+  esac
+}
+
+# The command-line agent itself, not an editor that shares its config folder.
+agent_installed() {
+  command -v "$(agent_binary "$1")" >/dev/null && return 0
+  [ "$1" = claude ] && [ -d "$HOME/.claude" ]
+}
+
+# Is this process (its comm and args) the agent's interactive process?
+agent_is_process() {
+  local agent=$1 name=${2##*/} args=$3
+  case "$agent:$name" in
+    claude:claude | copilot:copilot | cursor:cursor-agent | droid:droid | kiro:kiro-cli) return 0 ;;
+    codex:codex) case "$args" in *app-server*) return 1 ;; *) return 0 ;; esac ;; # not its daemon
+    opencode:opencode | opencode:opencode.exe) case "$args" in *serve*) return 1 ;; *) return 0 ;; esac ;;
+    claude:node) case "$args" in *claude-code* | */claude | */claude\ *) return 0 ;; esac ;;
+    gemini:node) case "$args" in */gemini | */gemini\ * | *gemini-cli*) return 0 ;; esac ;; # node under node
+    copilot:node) case "$args" in *copilot*) return 0 ;; esac ;;   # npm's loader, above the binary
+    cursor:node) case "$args" in *cursor-agent*) return 0 ;; esac ;; # its launcher execs node
+    qwen:node | qwen:bun) case "$args" in */qwen | */qwen\ * | *qwen-code*) return 0 ;; esac ;;
+    droid:node) case "$args" in */droid | */droid\ *) return 0 ;; esac ;;
+    kiro:node) case "$args" in *kiro*) return 0 ;; esac ;; # its engine, under kiro-cli
+  esac
+  return 1
+}
+
+# Reads a hook payload on stdin; prints: session id, cwd, transcript path, subagent marker, end reason, prompt.
+agent_hook_fields() {
+  local fields
+  case "$1" in
+    copilot) fields='.sessionId, .cwd, "", "", .reason, .prompt' ;;
+    cursor) fields='.conversation_id, (.workspace_roots[0]? // env.CURSOR_PROJECT_DIR), .transcript_path, "", .reason, .prompt' ;;
+    *) fields='.session_id, .cwd, .transcript_path, .agent_id, .reason, .prompt' ;; # Claude Code's names, which most adopted
+  esac
+  jq -r "[$fields] | map(. // \"\" | tostring) | .[5] |= (gsub(\"\\\\s+\"; \" \") | .[0:200]) | join(\"\\u001f\")"
+}
+
+# Did the session end because you switched to another one in the same process (/clear, /resume)? The
+# agent keeps running then, so its process can't tell. Every other end is settled by the agent's shell.
+agent_switched_session() {
+  case "$1:$2" in
+    claude:clear | claude:resume | claude:logout | claude:prompt_input_exit) return 0 ;;
+    gemini:clear | qwen:clear | droid:clear | droid:resume) return 0 ;;
+  esac
+  return 1
+}
+
+agent_resume_command() {
+  case "$1" in
+    claude) echo "claude --resume $2" ;;
+    codex) echo "codex resume $2" ;;
+    gemini) echo "gemini --resume $2" ;;
+    copilot) echo "copilot --resume=$2" ;;
+    cursor) echo "cursor-agent --resume=$2" ;;
+    qwen) echo "qwen --resume $2" ;;
+    droid) echo "droid --resume $2" ;;
+    kiro) echo "kiro-cli chat --resume-id $2" ;;
+    opencode) echo "opencode -s $2" ;;
+  esac
+}
+
+# A session's preview when its first prompt was not captured: Claude Code keeps a prompt history.
+agent_preview() {
+  case "$1" in
+    claude)
+      grep -F "\"sessionId\":\"$2\"" "$HOME/.claude/history.jsonl" 2>/dev/null |
+        jq -rs 'map(.display // "") | ((map(select(startswith("/") | not)) | first) // last // "")' 2>/dev/null
+      ;;
+  esac
+}
+
+# Where respawn puts its hooks. Some agents read a folder of hook files: there respawn owns its file.
+agent_hooks_file() {
+  local home
+  home=$(agent_home "$1")
+  case "$1" in
+    codex) echo "$home/hooks.json" ;;
+    copilot) echo "$home/hooks/respawn.json" ;;
+    cursor) echo "$home/hooks.json" ;;
+    kiro) echo "$home/hooks/respawn.json" ;;
+    opencode) echo "$home/plugins/respawn.js" ;;
+    droid) if [ -f "$home/hooks.json" ]; then echo "$home/hooks.json"; else echo "$home/settings.json"; fi ;;
+    *) echo "$home/settings.json" ;;
+  esac
+}
+
+agent_setup_note() {
+  local version
+  case "$1" in
+    codex) echo "Codex runs a new hook only once you approve it: open Codex, type /hooks, approve respawn's three" ;;
+    qwen)
+      version=$(version_of qwen)
+      if [ -n "$version" ] && version_below "$version" 0.14; then
+        echo "Qwen Code $version has no hooks yet: they start working once you update to 0.14 or later"
+      fi
+      ;;
+    opencode) echo "OpenCode 1.x; OpenCode 2 runs plugins in a shared server, where respawn can't see your tab" ;;
+  esac
+}
+
+version_of() { "$1" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1; }
+
+version_below() { # is version $1 below $2? (major.minor)
+  local a_major=${1%%.*} b_major=${2%%.*} a_rest=${1#*.} b_rest=${2#*.}
+  [ "$a_major" -lt "$b_major" ] && return 0
+  [ "$a_major" -gt "$b_major" ] && return 1
+  [ "${a_rest%%.*}" -lt "${b_rest%%.*}" ]
+}
+
+hook_command() { echo "$(shell_quote "$1") hook $2 $3"; } # bin agent event
+
+# Adds (setup) or removes (unsetup) respawn's hooks in the agent's own config. Returns 1 when nothing changed.
+agent_hooks() {
+  local action=$1 agent=$2 bin=$3 file
+  file=$(agent_hooks_file "$agent")
+  case "$agent" in
+    copilot | kiro | opencode) # a file of respawn's own
+      if [ "$action" = unsetup ]; then
+        [ -f "$file" ] || return 1
+        rm -f "$file"
+        return 0
+      fi
+      mkdir -p "$(dirname "$file")"
+      local tmp
+      tmp=$(mktemp "$file.XXXXXX")
+      own_hooks_file "$agent" "$bin" >"$tmp"
+      if [ -f "$file" ] && cmp -s "$tmp" "$file"; then
+        rm -f "$tmp"
+        return 1
+      fi
+      chmod 644 "$tmp"
+      mv "$tmp" "$file"
+      ;;
+    cursor)
+      if [ "$action" = unsetup ]; then
+        edit_json "$file" '.hooks |= (if . == null then . else map_values(map(select((.command // "") | test("respawn'"'"'? hook ") | not))) | with_entries(select(.value | length > 0)) end)'
+        return
+      fi
+      edit_json "$file" '
+        def ensure($event; $command): .hooks[$event] = ((.hooks[$event] // []) as $list
+          | if [$list[].command] | any(. == $command) then $list else $list + [{command: $command}] end);
+        .version = (.version // 1) | .hooks = (.hooks // {})
+        | ensure("sessionStart"; $start) | ensure("beforeSubmitPrompt"; $prompt) | ensure("sessionEnd"; $end)' \
+        --arg start "$(hook_command "$bin" cursor start)" --arg prompt "$(hook_command "$bin" cursor prompt)" \
+        --arg end "$(hook_command "$bin" cursor end)"
+      ;;
+    *) agent_hooks_like_claude "$action" "$agent" "$bin" "$file" ;;
+  esac
+}
+
+# Claude Code's shape, which Codex, Gemini CLI, Qwen Code and Factory Droid read too:
+# {"hooks": {"<Event>": [{"hooks": [{"type": "command", "command": ...}]}]}}
+agent_hooks_like_claude() {
+  local action=$1 agent=$2 bin=$3 file=$4 start=SessionStart prompt=UserPromptSubmit end=SessionEnd
+  local extra='{"timeout":10}' path='.hooks' version enable='.'
+  if [ "$action" = unsetup ]; then
+    if [ "$agent" = droid ] && [ "$(basename "$file")" = hooks.json ]; then
+      edit_json "$file" "$(unhook_filter top)"
+    else
+      edit_json "$file" "$(unhook_filter)"
+    fi
+    return
+  fi
+  case "$agent" in
+    codex) extra='{}' ;;
+    gemini)
+      prompt=BeforeAgent
+      extra='{"timeout":10000}' # milliseconds
+      version=$(version_of gemini)
+      if [ -n "$version" ] && version_below "$version" 0.24; then enable='.tools.enableHooks = true'; fi # off by default before 0.24
+      ;;
+    droid) [ "$(basename "$file")" = hooks.json ] && path='.' ;; # its hooks.json holds the events at the top
+  esac
+  edit_json "$file" '
+    def ensure($event; $command):
+      .[$event] = ((.[$event] // []) as $groups
+        | if [$groups[].hooks[]?.command] | any(. == $command) then $groups
+          else $groups + [{hooks: [{type: "command", command: $command} + $extra]}] end);
+    '"$path"' |= ((. // {}) | ensure($start; $start_command) | ensure($prompt; $prompt_command) | ensure($end; $end_command))
+    | '"$enable" \
+    --arg start "$start" --arg prompt "$prompt" --arg end "$end" --argjson extra "$extra" \
+    --arg start_command "$(hook_command "$bin" "$agent" start)" --arg prompt_command "$(hook_command "$bin" "$agent" prompt)" \
+    --arg end_command "$(hook_command "$bin" "$agent" end)"
+}
+
+# The whole file, for an agent that reads a folder of hook files (or plugins).
+own_hooks_file() {
+  local agent=$1 bin=$2
+  case "$agent" in
+    copilot)
+      jq -n --arg start "$(hook_command "$bin" copilot start)" --arg prompt "$(hook_command "$bin" copilot prompt)" \
+        --arg end "$(hook_command "$bin" copilot end)" \
+        '{version: 1, hooks: {
+            sessionStart: [{type: "command", bash: $start, timeoutSec: 10}],
+            userPromptSubmitted: [{type: "command", bash: $prompt, timeoutSec: 10}],
+            sessionEnd: [{type: "command", bash: $end, timeoutSec: 10}]}}'
+      ;;
+    kiro)
+      jq -n --arg start "$(hook_command "$bin" kiro start)" --arg prompt "$(hook_command "$bin" kiro prompt)" \
+        --arg end "$(hook_command "$bin" kiro end)" \
+        '{version: "v1", hooks: [
+            {name: "respawn-start", trigger: "SessionStart", action: {type: "command", command: $start}, enabled: true},
+            {name: "respawn-prompt", trigger: "UserPromptSubmit", action: {type: "command", command: $prompt}, enabled: true},
+            {name: "respawn-end", trigger: "SessionEnd", action: {type: "command", command: $end}, enabled: true}]}'
+      ;;
+    opencode)
+      cat <<EOF
+// respawn: records this OpenCode session, so that \`respawn\` can reopen it after your terminal goes away.
+// Written by \`respawn setup\`; \`respawn uninstall\` removes it. OpenCode has no end event: respawn tells a
+// closed terminal from a quit by whether the session's shell is still there.
+import { spawnSync } from "node:child_process"
+
+const RESPAWN = $(json_string "$bin")
+
+function send(event, payload) {
+  try {
+    spawnSync(RESPAWN, ["hook", "opencode", event], {
+      input: JSON.stringify(payload),
+      stdio: ["pipe", "ignore", "ignore"],
+      timeout: 5000,
+    })
+  } catch {}
+}
+
+export const Respawn = async ({ directory }) => ({
+  event: async ({ event }) => {
+    const info = event?.properties?.info
+    if (event?.type === "session.created" && info?.id && !info.parentID) {
+      send("start", { session_id: info.id, cwd: info.directory ?? directory })
+    }
+  },
+  "chat.message": async (input, output) => {
+    const id = input?.sessionID ?? output?.message?.sessionID
+    const prompt = (output?.parts ?? []).filter((part) => part.type === "text").map((part) => part.text).join(" ")
+    if (id) send("prompt", { session_id: id, cwd: directory, prompt })
+  },
+})
+EOF
+      ;;
+  esac
+}
+
+agent_hooked() {
+  local file
+  file=$(agent_hooks_file "$1")
+  [ -f "$file" ] && grep -q "hook $1 " "$file" && grep -q respawn "$file"
+}
+
+# jq filter dropping every hook whose command runs `respawn hook`, then any group or event left empty.
+# Only the events are touched: under "hooks", or, with "top", at the top of a file of nothing but events
+# (Factory Droid's hooks.json).
+unhook_filter() {
+  local clean='map_values(if type == "array" then
+        map(if type == "object" and (.hooks | type) == "array"
+            then .hooks |= map(select((.command // "") | test("respawn'"'"'? hook ") | not)) else . end)
+        | map(select(type != "object" or (.hooks | type) != "array" or (.hooks | length) > 0))
+      else . end) | with_entries(select((.value | type) != "array" or (.value | length) > 0))'
+  if [ "${1:-}" = top ]; then
+    printf '%s' "$clean"
+  else
+    printf 'if (.hooks | type) == "object" then .hooks |= (%s) | if .hooks == {} then del(.hooks) else . end else . end' "$clean"
+  fi
+}
+
+known_agent() { case " $AGENTS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# ---------- processes ----------
+
+parent_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# Alive, and the same process: after a reboot a pid is soon reused, and a zombie still answers kill -0.
+alive() {
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in '' | Z*) return 1 ;; esac
+  [ "$(started_at "$1")" = "$2" ]
+}
+
+is_agent_pid() { agent_is_process "$1" "$(ps -ww -o comm= -p "$2" 2>/dev/null)" "$(ps -ww -o args= -p "$2" 2>/dev/null)"; }
+
+# Is this process some other agent than this one? (Copilot CLI and Cursor CLI run Claude Code's hooks too.)
+other_agent_pid() {
+  local agent=$1 comm args other
+  comm=$(ps -ww -o comm= -p "$2" 2>/dev/null)
+  args=$(ps -ww -o args= -p "$2" 2>/dev/null)
+  for other in $AGENTS; do
+    [ "$other" != "$agent" ] && agent_is_process "$other" "$comm" "$args" && return 0
+  done
+  return 1
+}
+
+# The agent process running this hook: the nearest ancestor that is the agent, then up to its
+# outermost process (Gemini CLI, for one, runs as a node process under another). A hook belongs to its
+# nearest agent: meeting another agent first means this hook is not this agent's.
+agent_pid() {
+  local agent=$1 pid=$PPID parent _
+  for _ in $(seq 1 "$ANCESTOR_DEPTH"); do
+    [ "$pid" -gt 1 ] 2>/dev/null || return 1
+    other_agent_pid "$agent" "$pid" && return 1
+    if is_agent_pid "$agent" "$pid"; then
+      parent=$(parent_of "$pid")
+      while [ "$parent" -gt 1 ] 2>/dev/null && is_agent_pid "$agent" "$parent"; do
+        pid=$parent
+        parent=$(parent_of "$pid")
+      done
+      echo "$pid"
+      return 0
+    fi
+    pid=$(parent_of "$pid")
+  done
+  return 1
+}
+
+process_cwd() {
+  if [ -d /proc ]; then readlink "/proc/$1/cwd"; else lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'; fi
+}
+
+# For an agent whose hooks run in a daemon: its interactive process in that folder, not yet claimed by
+# another of its sessions. With several, the newest.
+agent_pid_by_cwd() {
+  local agent=$1 cwd real pid tty name found=""
+  real=$(cd "$2" 2>/dev/null && pwd -P) || return 1
+  while read -r pid tty name; do
+    case "$tty" in '' | '?' | '??') continue ;; esac
+    case "${name##*/}" in "$(agent_binary "$agent")" | node | bun) ;; *) continue ;; esac # cheap, before asking ps
+    is_agent_pid "$agent" "$pid" || continue
+    cwd=$(process_cwd "$pid")
+    [ -n "$cwd" ] && [ "$(cd "$cwd" 2>/dev/null && pwd -P)" = "$real" ] || continue
+    grep -qs "\"pid\": $pid," "$RECORDS/$agent".*.json && continue
+    found=$pid
+  done < <(ps -A -ww -o pid=,tty=,comm= | sort -n)
+  [ -n "$found" ] && echo "$found"
+}
+
+# ---------- the hooks ----------
+
+hook() {
+  local agent=${1:-} event=${2:-} id cwd transcript subagent reason prompt file
+  known_agent "$agent" || return 0
+  IFS=$SEP read -r id cwd transcript subagent reason prompt < <(agent_hook_fields "$agent")
+  valid_id "$id" || return 0
+  [ -z "$subagent" ] || return 0 # a subagent or teammate is not a session to reopen
+  [ -n "$cwd" ] || cwd=$PWD      # an agent that sends no cwd runs its hooks in the session's folder
+  file="$RECORDS/$agent.$id.json"
+  case "$prompt" in /*) prompt="" ;; esac # a slash command says nothing about what the session is for
+  case "$event" in
+    start) record "$agent" "$id" "$cwd" "$transcript" "" ;;
+    prompt)
+      if [ -f "$file" ]; then
+        if [ -n "$prompt" ]; then remember_prompt "$file" "$prompt"; fi
+      else
+        record "$agent" "$id" "$cwd" "$transcript" "$prompt" # a session open before respawn was installed
+      fi
+      ;;
+    end) end_hook "$agent" "$file" "$reason" ;;
+  esac
+}
+
+record() {
+  local agent=$1 id=$2 cwd=$3 transcript=$4 prompt=$5 file pid tty parent first=""
+  file="$RECORDS/$agent.$id.json"
+  if [ -f "$file" ]; then first=$(jq -r '.first_prompt // ""' "$file" 2>/dev/null); fi
+  [ -n "$first" ] || first=$prompt
+  # Codex runs its hooks in a background daemon, not under the window you type in: find that window by its folder
+  pid=$(agent_pid "$agent") || pid=$(agent_pid_by_cwd "$agent" "$cwd")
+  [ -n "$pid" ] || return 0
+  tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$tty" in '' | '?' | '??') return 0 ;; esac # headless runs and background sessions have no terminal
+  parent=$(parent_of "$pid")
+  mkdir -p "$RECORDS"
+  jq -n --arg agent "$agent" --arg id "$id" --arg cwd "$cwd" --arg transcript "$transcript" \
+    --argjson pid "$pid" --arg started "$(started_at "$pid")" --arg tty "$tty" \
+    --argjson parent "${parent:-0}" --arg parent_started "$(started_at "${parent:-0}")" \
+    --arg first "$first" --arg terminal "$(detect_terminal)" --argjson now "$(date +%s)" \
+    '{agent: $agent, session_id: $id, cwd: $cwd, transcript: $transcript, pid: $pid, process_started: $started,
+      tty: $tty, parent_pid: $parent, parent_started: $parent_started, first_prompt: $first,
+      terminal: $terminal, recorded_at: $now}' \
+    >"$file.$$" && mv "$file.$$" "$file"
+}
+
+remember_prompt() { # the session's first prompt, kept once
+  jq -e '(.first_prompt // "") == ""' "$1" >/dev/null 2>&1 || return 0
+  jq --arg prompt "$2" '.first_prompt = $prompt' "$1" >"$1.$$" && mv "$1.$$" "$1"
+}
+
+# Linux signals every process at once when it shuts down: don't read that as you quitting.
+shutting_down() { command -v systemctl >/dev/null && [ "$(systemctl is-system-running 2>/dev/null)" = stopping ]; }
+
+# A session ended. Forget it if you left it on purpose; keep it if its terminal went away.
+end_hook() {
+  local agent=$1 file=$2 reason=$3 pid started parent parent_started
+  [ -f "$file" ] || return 0
+  if agent_switched_session "$agent" "$reason"; then
+    rm -f "$file"
+    return 0
+  fi
+  shutting_down && return 0
+  IFS=$SEP read -r pid started parent parent_started < <(jq -r \
+    '[.pid, .process_started, .parent_pid, .parent_started] | map(. // "" | tostring) | join("\u001f")' "$file")
+  # Moved to another parent: its shell went first, which is what a closing terminal does. Keep it.
+  if alive "$pid" "$started" && [ "$(parent_of "$pid")" != "$parent" ]; then return 0; fi
+  # Otherwise wait for the agent to exit, in the background so that it can go on exiting.
+  (
+    trap '' HUP
+    settle_end "$file" "$pid" "$started" "$parent" "$parent_started"
+  ) </dev/null >/dev/null 2>&1 &
+  return 0
+}
+
+# The agent exited and its shell, the tab, is still there: you quit it. Still running after a few seconds:
+# the agent only ended an idle session (Codex does, after 30 minutes), and the session is still open.
+settle_end() {
+  local file=$1 pid=$2 started=$3 parent=$4 parent_started=$5 _
+  for _ in $(seq 1 30); do
+    alive "$pid" "$started" || break
+    sleep 0.1
+  done
+  alive "$pid" "$started" && return 0
+  alive "$parent" "$parent_started" || return 0
+  # unless the session was reopened elsewhere meanwhile, and recorded with its new process
+  [ "$(jq -r '.pid' "$file" 2>/dev/null)" = "$pid" ] && rm -f "$file"
+}
+
+# ---------- terminals ----------
+# Every opener reads $TABS_FILE: one line per session, its folder, the command that resumes it, a title.
+# Where the terminal types into a fresh shell, the command runs there and the shell stays.
+# Where it launches a program instead, keep_shell runs the command in a login shell that stays afterwards.
+
+TERMINALS="warp iterm2 terminal ghostty kitty wezterm alacritty tmux zellij gnome-terminal ptyxis konsole x-terminal-emulator print"
+
+terminal_label() {
+  case "$1" in
+    warp) echo "Warp" ;;
+    iterm2) echo "iTerm2" ;;
+    terminal) echo "Terminal.app" ;;
+    ghostty) echo "Ghostty" ;;
+    kitty) echo "kitty" ;;
+    wezterm) echo "WezTerm" ;;
+    alacritty) echo "Alacritty" ;;
+    tmux) echo "tmux" ;;
+    zellij) echo "Zellij" ;;
+    gnome-terminal) echo "GNOME Terminal" ;;
+    ptyxis) echo "Ptyxis" ;;
+    konsole) echo "Konsole" ;;
+    x-terminal-emulator) echo "new terminal windows" ;;
+    print) echo "this terminal (printed commands)" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# The terminal this process runs in, from the environment it inherited. A multiplexer first:
+# inside one, the outer terminal's variables are stale. Then TERM, which kitty, Ghostty and
+# Alacritty set while leaving a TERM_PROGRAM inherited from whatever launched them.
+detect_terminal() {
+  if [ -n "${RESPAWN_TERMINAL:-}" ]; then
+    echo "$RESPAWN_TERMINAL"
+    return
+  fi
+  if [ -n "${TMUX:-}" ]; then
+    echo tmux
+  elif [ -n "${ZELLIJ:-}" ]; then
+    echo zellij
+  elif [ "${TERM:-}" = xterm-kitty ] || [ -n "${KITTY_WINDOW_ID:-}" ]; then
+    echo kitty
+  elif [ "${TERM:-}" = xterm-ghostty ] || [ "${TERM_PROGRAM:-}" = ghostty ]; then
+    echo ghostty
+  elif [ "${TERM:-}" = alacritty ] || [ -n "${ALACRITTY_WINDOW_ID:-}" ]; then
+    echo alacritty
+  else
+    case "${TERM_PROGRAM:-}" in
+      WarpTerminal) echo warp ;;
+      iTerm.app) echo iterm2 ;;
+      Apple_Terminal) echo terminal ;;
+      WezTerm) echo wezterm ;;
+      vscode) echo print ;; # an editor's terminal can't be scripted from outside
+      *)
+        if [ -n "${WEZTERM_PANE:-}" ]; then
+          echo wezterm
+        elif [ -n "${KONSOLE_VERSION:-}" ]; then
+          echo konsole
+        elif [ -n "${PTYXIS_VERSION:-}" ]; then
+          echo ptyxis
+        elif [ -n "${GNOME_TERMINAL_SERVICE:-}" ]; then
+          echo gnome-terminal
+        elif [ "${LC_TERMINAL:-}" = iTerm2 ]; then
+          echo iterm2
+        elif [ "$(uname)" = Darwin ]; then
+          echo terminal # always installed on a Mac
+        elif command -v x-terminal-emulator >/dev/null; then
+          echo x-terminal-emulator
+        else
+          echo print
+        fi
+        ;;
+    esac
+  fi
+}
+
+open_tabs() {
+  case "$1" in
+    warp) open_warp ;;
+    iterm2) open_applescript iterm2 ;;
+    terminal) open_applescript terminal ;;
+    ghostty) if [ "$(uname)" = Darwin ]; then open_applescript ghostty; else open_ghostty_linux; fi ;;
+    kitty) open_kitty ;;
+    wezterm) open_wezterm ;;
+    alacritty) open_alacritty ;;
+    tmux) open_tmux ;;
+    zellij) open_zellij ;;
+    gnome-terminal) open_gnome_terminal ;;
+    ptyxis) open_ptyxis ;;
+    konsole) open_konsole ;;
+    x-terminal-emulator) open_x_terminal_emulator ;;
+    *) open_print ;;
+  esac
+}
+
+each_tab() { # calls "$@" cwd command title, for every tab, in order; stops at the first failure
+  local cwd command title
+  # The list comes in on fd 3 and each call gets no stdin: a terminal command that reads stdin
+  # would otherwise swallow the rest of the list.
+  while IFS=$SEP read -r cwd command title <&3; do
+    "$@" "$cwd" "$command" "$title" </dev/null || return 1
+  done 3<"$TABS_FILE"
+}
+
+user_shell() { echo "${SHELL:-/bin/sh}"; }
+
+# The command, run by a login shell that loads your PATH and stays open once the command ends.
+keep_shell_line() { printf '%s -lic %s' "$(shell_quote "$(user_shell)")" "$(shell_quote "$1; exec $(shell_quote "$(user_shell)") -l")"; }
+
+typed_line() { echo "cd $(shell_quote "$1") && $2"; }
+
+opener_file() { # a file the terminal reads after this script has returned, so it must outlive it
+  mkdir -p "$STATE_DIR"
+  echo "$STATE_DIR/$1"
+}
+
+open_warp() {
+  local name=respawn dir yaml
+  if [ "$(uname)" = Darwin ]; then dir="$HOME/.warp/launch_configurations"; else dir="${XDG_DATA_HOME:-$HOME/.local/share}/warp-terminal/launch_configurations"; fi
+  yaml="---
+name: $name
+windows:
+  - tabs:"
+  add_warp_tab() {
+    yaml+="
+      - title: $(json_string "$3")
+        layout:
+          cwd: $(json_string "$1")
+          commands:
+            - exec: $(json_string "$2")"
+  }
+  each_tab add_warp_tab
+  mkdir -p "$dir"
+  printf '%s\n' "$yaml" >"$dir/$name.yaml"
+  # Warp finds a launch configuration by the name inside it, not by its file
+  if [ "$(uname)" = Darwin ]; then open "warp://launch/$name"; else xdg-open "warp://launch/$name"; fi
+}
+
+# iTerm2, Terminal.app and Ghostty on macOS: AppleScript, with every value passed as an argument.
+open_applescript() {
+  local app=$1 args=()
+  collect() { args+=("$1" "$2"); }
+  each_tab collect
+  case "$app" in
+    iterm2)
+      osascript - "${args[@]}" >/dev/null <<'EOF'
+on run argv
+  tell application "iTerm2"
+    activate
+    set w to (create window with default profile)
+    repeat with i from 1 to (count argv) by 2
+      if i > 1 then tell w to create tab with default profile
+      tell current session of w to write text ("cd " & quoted form of item i of argv & " && " & item (i + 1) of argv)
+    end repeat
+  end tell
+end run
+EOF
+      ;;
+    terminal) # Terminal.app cannot script tabs: one window per session
+      osascript - "${args[@]}" >/dev/null <<'EOF'
+on run argv
+  tell application "Terminal"
+    activate
+    repeat with i from 1 to (count argv) by 2
+      do script ("cd " & quoted form of item i of argv & " && " & item (i + 1) of argv)
+    end repeat
+  end tell
+end run
+EOF
+      ;;
+    ghostty) # Ghostty 1.3 and later
+      osascript - "${args[@]}" >/dev/null <<'EOF'
+on run argv
+  tell application "Ghostty"
+    activate
+    set w to missing value
+    repeat with i from 1 to (count argv) by 2
+      set cfg to new surface configuration
+      set initial working directory of cfg to item i of argv
+      set initial input of cfg to (item (i + 1) of argv & return)
+      if w is missing value then
+        set w to new window with configuration cfg
+      else
+        new tab in w with configuration cfg
+      end if
+    end repeat
+  end tell
+end run
+EOF
+      ;;
+  esac
+}
+
+open_ghostty_linux() { # +new-window and +new-tab (Ghostty 1.4) talk to the running instance over D-Bus
+  local first=1
+  add_ghostty_tab() {
+    local verb=+new-tab
+    [ "$first" = 1 ] && verb=+new-window
+    first=0
+    ghostty "$verb" --working-directory="$1" -e "$(user_shell)" -lic "$2; exec $(shell_quote "$(user_shell)") -l"
+  }
+  each_tab add_ghostty_tab
+}
+
+open_kitty() { # a session file: needs no remote control
+  local file
+  file=$(opener_file kitty.session)
+  : >"$file"
+  add_kitty_tab() {
+    printf 'new_tab %s\ncd %s\nlaunch %s\n' "$3" "$1" "$(keep_shell_line "$2")" >>"$file"
+  }
+  each_tab add_kitty_tab
+  if [ "$(uname)" = Darwin ]; then open -na kitty.app --args --session "$file"; else kitty --detach --session "$file"; fi
+}
+
+open_wezterm() {
+  local first_pane="" pane
+  add_wezterm_tab() {
+    if [ -z "$first_pane" ]; then
+      pane=$(wezterm cli spawn --new-window --cwd "$1") || return 1
+      first_pane=$pane
+    else
+      pane=$(wezterm cli spawn --pane-id "$first_pane" --cwd "$1") || return 1 # a tab in that pane's window
+    fi
+    wezterm cli send-text --no-paste --pane-id "$pane" "$2"$'\n'
+  }
+  each_tab add_wezterm_tab
+}
+
+open_alacritty() { # Alacritty has no tabs to script: one window per session
+  add_alacritty_window() {
+    alacritty msg create-window --working-directory "$1" -e "$(user_shell)" -lic "$2; exec $(shell_quote "$(user_shell)") -l"
+  }
+  each_tab add_alacritty_window
+}
+
+open_tmux() {
+  local session="" pane
+  add_tmux_window() {
+    if [ -n "${TMUX:-}" ]; then
+      pane=$(tmux new-window -P -F '#{pane_id}' -c "$1" -n "$3") || return 1
+    elif [ -z "$session" ]; then
+      session=respawn
+      pane=$(tmux new-session -d -P -F '#{pane_id}' -s "$session" -c "$1" -n "$3") || return 1
+    else
+      pane=$(tmux new-window -P -F '#{pane_id}' -t "$session:" -c "$1" -n "$3") || return 1
+    fi
+    tmux send-keys -t "$pane" -l "$2" && tmux send-keys -t "$pane" Enter
+  }
+  each_tab add_tmux_window || return 1
+  [ -n "$session" ] && say "They are in a new tmux session: tmux attach -t $session"
+  return 0
+}
+
+kdl_string() {
+  local s=${1//\\/\\\\}
+  printf '"%s"' "${s//\"/\\\"}"
+}
+
+open_zellij() { # a layout: inside a session, its tabs open in that session
+  local file
+  file=$(opener_file zellij-layout.kdl)
+  echo "layout {" >"$file"
+  add_zellij_tab() {
+    printf '  tab name=%s cwd=%s {\n    pane command=%s {\n      args "-lic" %s\n    }\n  }\n' \
+      "$(kdl_string "$3")" "$(kdl_string "$1")" "$(kdl_string "$(user_shell)")" \
+      "$(kdl_string "$2; exec $(shell_quote "$(user_shell)") -l")" >>"$file"
+  }
+  each_tab add_zellij_tab
+  echo "}" >>"$file"
+  zellij --layout "$file"
+}
+
+open_gnome_terminal() { # --tab opens in the window opened last
+  local where=--window
+  add_gnome_tab() {
+    gnome-terminal "$where" --working-directory="$1" -- "$(user_shell)" -lic "$2; exec $(shell_quote "$(user_shell)") -l"
+    where=--tab
+  }
+  each_tab add_gnome_tab
+}
+
+open_ptyxis() { # -x is parsed with shell quoting rules
+  local where=--new-window
+  add_ptyxis_tab() {
+    ptyxis "$where" -d "$1" -x "$(keep_shell_line "$2")"
+    where=--tab
+  }
+  each_tab add_ptyxis_tab
+}
+
+open_konsole() { # --tabs-from-file splits a command on spaces with no quoting: one small script per tab
+  local file n=0
+  file=$(opener_file konsole-tabs)
+  : >"$file"
+  add_konsole_tab() {
+    local script
+    n=$((n + 1))
+    script=$(opener_file "konsole-tab-$n.sh")
+    printf '#!/bin/sh\nexec %s\n' "$(keep_shell_line "$2")" >"$script"
+    chmod +x "$script"
+    printf 'title: %s;; workdir: %s;; command: %s\n' "$3" "$1" "$script" >>"$file"
+  }
+  each_tab add_konsole_tab
+  konsole --tabs-from-file "$file" >/dev/null 2>&1 &
+}
+
+open_x_terminal_emulator() { # only -e and -T are guaranteed: one window per session
+  add_x_window() {
+    x-terminal-emulator -T "$3" -e sh -c 'cd "$1" && exec "$2" -lic "$3; exec \"$2\" -l"' sh "$1" "$(user_shell)" "$2" >/dev/null 2>&1 &
+  }
+  each_tab add_x_window
+}
+
+open_print() {
+  say "Run each of these in a tab of its own:"
+  print_line() { say "  $(typed_line "$1" "$2")"; }
+  each_tab print_line
+}
+
+# ---------- restoring ----------
+
+# One line per cut-off session, newest first: agent, id, cwd, last activity (epoch), preview.
+cut_off_sessions() {
+  local file agent id cwd transcript pid started parent parent_started recorded first mtime now preview
+  now=$(date +%s)
+  for file in "$RECORDS"/*.json; do
+    [ -e "$file" ] || continue
+    IFS=$SEP read -r agent id cwd transcript pid started parent parent_started recorded first < <(jq -r \
+      '[.agent, .session_id, .cwd, .transcript, .pid, .process_started, .parent_pid, .parent_started, .recorded_at, .first_prompt]
+       | map(. // "" | tostring) | join("\u001f")' "$file")
+    known_agent "$agent" || continue
+    alive "$pid" "$started" && continue           # still running
+    alive "$parent" "$parent_started" && continue # it ended while its tab stayed open: you saw it go
+    mtime=$recorded
+    if [ -n "$transcript" ]; then
+      [ -f "$transcript.zst" ] && transcript="$transcript.zst" # Codex recompresses a session it has not touched for a while
+      if [ ! -f "$transcript" ]; then # never got a message: nothing to resume
+        rm -f "$file"
+        continue
+      fi
+      mtime=$(modified_at "$transcript")
+    fi
+    if [ $((now - mtime)) -gt $((MAX_AGE_DAYS * 86400)) ]; then
+      rm -f "$file"
+      continue
+    fi
+    preview=$first
+    [ -n "$preview" ] || preview=$(agent_preview "$agent" "$id")
+    preview=$(printf '%s' "$preview" | tr -s '\n\t ' '   ' | sed 's/^ //; s/ $//' | cut -c1-"$PREVIEW_CHARS")
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$agent" "$id" "$cwd" "$mtime" "$preview"
+  done | sort -t "$SEP" -k4,4nr
+}
+
+ago() {
+  local seconds=$(($(date +%s) - $1))
+  if [ "$seconds" -lt 3600 ]; then
+    echo "$((seconds / 60))m ago"
+  elif [ "$seconds" -lt 86400 ]; then
+    echo "$((seconds / 3600))h ago"
+  else
+    echo "$((seconds / 86400))d ago"
+  fi
+}
+
+short_path() {
+  local path=${1/#$HOME/\~}
+  if [ "${#path}" -gt "$PATH_CHARS" ]; then
+    path="...${path: -$((PATH_CHARS - 3))}"
+  fi
+  echo "$path"
+}
+
+restore() {
+  local mode=$1 terminal=$2 sessions count selected answer n line agent id cwd mtime preview i=0 picked=""
+  sessions=$(cut_off_sessions)
+  if [ -z "$sessions" ]; then
+    say "No cut-off agent sessions."
+    return 0
+  fi
+  count=$(printf '%s\n' "$sessions" | wc -l | tr -d ' ')
+
+  if [ "$mode" = clear ]; then
+    while IFS=$SEP read -r agent id _; do rm -f "$RECORDS/$agent.$id.json"; done <<<"$sessions"
+    say "Forgot $count cut-off $(plural "$count" session). Each agent still has them in its own resume list."
+    return 0
+  fi
+
+  if [ "$count" = 1 ]; then say "1 agent session was cut off:"; else say "$count agent sessions were cut off:"; fi
+  while IFS=$SEP read -r agent id cwd mtime preview; do
+    i=$((i + 1))
+    printf '  %2d. %-8s %-*s %8s  %s\n' "$i" "$agent" "$PATH_CHARS" "$(short_path "$cwd")" "$(ago "$mtime")" "${preview:-(no prompt)}"
+  done <<<"$sessions"
+  [ "$mode" = list ] && return 0
+
+  selected=$(seq 1 "$count")
+  if [ "$mode" = ask ]; then
+    printf 'Reopen them in %s? [Y/n, or numbers like "1 3"] ' "$(terminal_label "$terminal")"
+    read -r answer
+    case "$answer" in
+      '' | y | Y | yes) ;;
+      n | N | no) return 0 ;;
+      *) selected=$(echo "$answer" | tr ',' ' ') ;;
+    esac
+  fi
+
+  TABS_FILE=$(mktemp)
+  for n in $selected; do
+    case "$n" in '' | *[!0-9]*)
+      warn "not a number: $n"
+      rm -f "$TABS_FILE"
+      return 2
+      ;;
+    esac
+    if [ "$n" -lt 1 ] || [ "$n" -gt "$count" ]; then
+      warn "no session $n"
+      rm -f "$TABS_FILE"
+      return 2
+    fi
+    line=$(printf '%s\n' "$sessions" | sed -n "${n}p")
+    IFS=$SEP read -r agent id cwd mtime preview <<<"$line"
+    [ -d "$cwd" ] || cwd=$HOME # its folder is gone (a removed worktree): the agent finds the session by id
+    printf '%s\x1f%s\x1f%s\n' "$cwd" "$(agent_resume_command "$agent" "$id")" "$agent ${cwd##*/}" >>"$TABS_FILE"
+    picked+=" $agent.$id"
+  done
+
+  if [ "$mode" = dry ]; then
+    open_print
+    rm -f "$TABS_FILE"
+    return 0
+  fi
+  if ! open_tabs "$terminal"; then
+    warn "could not open tabs in $(terminal_label "$terminal"); here are the commands instead"
+    open_print
+    rm -f "$TABS_FILE"
+    return 1
+  fi
+  rm -f "$TABS_FILE"
+  [ "$terminal" = print ] && return 0 # nothing was reopened yet: keep the records
+  n=0
+  for line in $picked; do # each session records itself again as it starts
+    rm -f "$RECORDS/$line.json"
+    n=$((n + 1))
+  done
+  say "Reopened $n $(plural "$n" session) in $(terminal_label "$terminal")."
+}
+
+# ---------- setup ----------
+
+this_script() { echo "$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"; }
+
+setup() {
+  local action=$1 bin agent result any=0
+  bin=$(this_script)
+  for agent in $AGENTS; do
+    agent_installed "$agent" || continue
+    any=1
+    agent_hooks "$action" "$agent" "$bin"
+    result=$?
+    case "$action:$result" in
+      setup:0 | setup:1)
+        if [ "$result" = 0 ]; then
+          say "  $(agent_label "$agent"): hooks added to $(agent_hooks_file "$agent")"
+        else
+          say "  $(agent_label "$agent"): hooks already there"
+        fi
+        if [ -n "$(agent_setup_note "$agent")" ]; then say "    $(agent_setup_note "$agent")"; fi
+        ;;
+      unsetup:0) say "  $(agent_label "$agent"): hooks removed from $(agent_hooks_file "$agent")" ;;
+      unsetup:1) ;;
+      *) say "  $(agent_label "$agent"): skipped (see above)" ;;
+    esac
+  done
+  [ "$any" = 1 ] || say "  No supported agent found. Install one, then run: respawn setup"
+}
+
+doctor() {
+  local agent records
+  say "respawn $VERSION"
+  say "Agents:"
+  for agent in $AGENTS; do
+    if ! agent_installed "$agent"; then
+      printf '  %-12s not installed\n' "$(agent_label "$agent")"
+    elif agent_hooked "$agent"; then
+      printf '  %-12s hooks installed\n' "$(agent_label "$agent")"
+    else
+      printf '  %-12s installed, no hooks: run respawn setup\n' "$(agent_label "$agent")"
+    fi
+  done
+  say "Terminal: $(terminal_label "$(detect_terminal)")"
+  records=$(find "$RECORDS" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+  say "Records: $records in $RECORDS"
+}
+
+main() {
+  local terminal
+  terminal=$(detect_terminal)
+  case "${1:-}" in
+    hook)
+      shift
+      hook "$@"
+      exit 0 # a hook never fails: a broken record must not get in the way of a session
+      ;;
+    --in)
+      [ -n "${2:-}" ] || { warn "--in needs a terminal, one of: $TERMINALS"; exit 2; }
+      case " $TERMINALS " in *" $2 "*) ;; *) warn "unknown terminal: $2 (one of: $TERMINALS)"; exit 2 ;; esac
+      terminal=$2
+      shift 2
+      ;;
+  esac
+  case "${1:-}" in
+    '') restore ask "$terminal" ;;
+    -y | --yes) restore all "$terminal" ;;
+    -l | --list) restore list "$terminal" ;;
+    -n | --dry-run) restore dry "$terminal" ;;
+    --clear) restore clear "$terminal" ;;
+    setup) setup setup ;;
+    uninstall)
+      setup unsetup
+      rm -rf "$STATE_DIR" "$HOME/.warp/launch_configurations/respawn.yaml"
+      say "Removed respawn's hooks and records."
+      ;;
+    doctor) doctor ;;
+    -v | --version) say "respawn $VERSION" ;;
+    -h | --help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0" ;;
+    *)
+      warn "unknown option: $1 (see respawn --help)"
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,161 +1,206 @@
-# claude-restore
+# respawn
 
-**Quit Warp. Restart your Mac. Get every Claude Code session back.**
+**Your terminal quit. Your Mac restarted. Every coding agent comes back, right where it was.**
 
-[![CI](https://github.com/lorenzobalzani/claude-restore/actions/workflows/ci.yml/badge.svg)](https://github.com/lorenzobalzani/claude-restore/actions/workflows/ci.yml)
+[![CI](https://github.com/lorenzobalzani/respawn/actions/workflows/ci.yml/badge.svg)](https://github.com/lorenzobalzani/respawn/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![macOS](https://img.shields.io/badge/macOS-Warp-black)
-![Claude Code hooks](https://img.shields.io/badge/Claude%20Code-hooks-d97757)
+![macOS and Linux](https://img.shields.io/badge/macOS%20%7C%20Linux-bash%203.2%2B-black)
+![Agents](https://img.shields.io/badge/agents-9-d97757)
+![Terminals](https://img.shields.io/badge/terminals-12-3fb950)
 
-You have eight Claude Code sessions open in Warp tabs. Warp installs an update, the Mac restarts, or you hit
-<kbd>⌘</kbd><kbd>Q</kbd>. Warp brings the tabs back, but not what ran in them: every Claude session is gone.
-`claude --resume` lists a few hundred past conversations, with no hint of which eight were open or what
-each one was doing.
+<p align="center"><img src="docs/demo.svg" alt="respawn lists five cut-off sessions from Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor CLI, and reopens them all in Warp" width="100%"></p>
 
-The conversations themselves are safe, since Claude Code saves every transcript to disk. What you lose is
-**which ones were open**. claude-restore keeps track of that, and brings them all back with one command:
+You had eight agent sessions open: Claude Code in one tab, Codex in another, Gemini CLI on the infra repo.
+Then the terminal updated itself, or the Mac restarted, or you hit <kbd>⌘</kbd><kbd>Q</kbd>. The tabs may come
+back, but the agents in them don't. Each agent kept its conversations on disk, and each can resume one by id,
+but none of them remembers **which ones were open**. So you scroll a list of a few hundred past sessions,
+trying to remember what you were doing.
+
+respawn remembers. After the crash, one command:
 
 ```console
-$ claude-restore
-3 Claude session(s) were cut off:
-   1. ~/code/api                      12m ago  migrate the billing tables to the new schema
-   2. ~/code/web                      14m ago  fix the flaky checkout end-to-end test
-   3. ~/code/infra                     1h ago  why does the deploy hang on the migration step?
-Reopen them in a new Warp window? [Y/n, or numbers like "1 3"]
+$ respawn
 ```
 
-Press <kbd>Enter</kbd> and one Warp window opens, with a tab per session. Each tab starts in that session's
-own folder and runs `claude --resume <id>`, so you are back in the same conversation.
+lists every agent session that was cut off, with the folder it ran in and the first thing you asked it, and
+reopens each one in its own tab of the terminal you're in, resumed by id, in its own folder.
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lorenzobalzani/claude-restore/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lorenzobalzani/respawn/main/install.sh | bash
 ```
 
-Or from a clone:
+Or from a clone: `git clone https://github.com/lorenzobalzani/respawn.git && cd respawn && ./install.sh`.
 
-```bash
-git clone https://github.com/lorenzobalzani/claude-restore.git
-cd claude-restore && ./install.sh
-```
+The installer puts `respawn` in `~/.local/bin` and adds its hooks to every supported agent it finds. It
+changes nothing else in their settings, keeps a backup of every file it edits, leaves alone a file that isn't
+valid JSON, and adds nothing when run again. Sessions you start from then on are recorded; ones already open
+are recorded on their next prompt, so there is nothing to restart. Install an agent later? Run `respawn setup`.
 
-The installer does two things:
-
-- copies `claude-restore` to `~/.local/bin` (`BIN_DIR=... ./install.sh` to put it elsewhere)
-- adds three hooks to `~/.claude/settings.json`, leaving everything else in it as it was. It backs the file
-  up first, refuses to touch a file that is not valid JSON, and adds nothing when run again.
-
-Sessions you start after installing are recorded right away. Sessions that are already open get recorded
-on their next prompt, so there is nothing to restart.
-
-**Needs:** macOS, [Warp](https://www.warp.dev), [Claude Code](https://code.claude.com), and `jq` (it ships
-with macOS 15 and later; otherwise `brew install jq`).
+**Needs:** bash (the 3.2 that macOS ships is enough) and `jq` (in macOS 15 and later; otherwise
+`brew install jq` or `apt install jq`). Nothing else, and nothing ever leaves your machine.
 
 ## Usage
 
 | Command | What it does |
 | :- | :- |
-| `claude-restore` | List the cut-off sessions, ask, reopen them in a new Warp window |
-| `claude-restore -y` | Reopen all of them without asking |
-| `claude-restore --list` | Only list them |
-| `claude-restore --dry-run` | Print the Warp launch configuration instead of opening it |
-| `claude-restore --clear` | Forget the cut-off sessions without reopening them (they stay in `claude --resume`) |
+| `respawn` | List the cut-off sessions, ask, reopen them in new tabs |
+| `respawn -y` | Reopen all of them without asking |
+| `respawn --list` | Only list them |
+| `respawn --dry-run` | Print the commands instead of opening anything |
+| `respawn --in kitty` | Open them in another terminal than the one you're in |
+| `respawn --clear` | Forget the cut-off sessions (each agent still has them in its own resume list) |
+| `respawn setup` | Add the hooks to every supported agent installed here |
+| `respawn doctor` | Show the agents respawn sees, their hooks, your terminal, its records |
+| `respawn uninstall` | Remove the hooks and the records |
 
 When it asks, type `1 3` to reopen only some of them.
 
+## Agents
+
+| Agent | Resumed with | Checked |
+| :- | :- | :- |
+| [Claude Code](https://code.claude.com) | `claude --resume <id>` | **Live**: a real session, quit and closed |
+| [Codex](https://github.com/openai/codex) | `codex resume <id>` | Its source; tested with a stand-in |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini --resume <id>` | Its source; tested with a stand-in |
+| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli) | `copilot --resume=<id>` | Its docs; tested with a stand-in |
+| [Cursor CLI](https://cursor.com/cli) | `cursor-agent --resume=<id>` | Its docs; tested with a stand-in |
+| [Qwen Code](https://github.com/QwenLM/qwen-code) (0.14 and later) | `qwen --resume <id>` | Its source; tested with a stand-in |
+| [Factory Droid](https://factory.ai) | `droid --resume <id>` | Its docs; tested with a stand-in |
+| [Kiro CLI](https://kiro.dev/cli) | `kiro-cli chat --resume-id <id>` | Its docs; tested with a stand-in |
+| [OpenCode](https://opencode.ai) 1.x | `opencode -s <id>` | Its source; tested with a stand-in |
+
+**Codex** runs a hook only once you approve it: after installing, open Codex, type `/hooks` and approve
+respawn's three. **OpenCode** has no command hooks, so respawn installs a small plugin instead.
+
+"Tested with a stand-in" means the test suite runs that agent's hook flow under a fake process that carries the
+agent's name, command line, terminal and shell, the way the real one does. If an agent behaves differently on
+your machine, `respawn doctor` and an issue with its output are the fastest way to a fix.
+
+**Not yet:** [Goose](https://github.com/aaif-goose/goose) (its plugin manifest isn't documented),
+[Crush](https://github.com/charmbracelet/crush) (where its user-level hooks file lives), [Amp](https://ampcode.com)
+(plugins only, with no session end and no folder), OpenCode 2 (plugins run in a shared server, away from your
+tab) and [Aider](https://aider.chat) (no session ids). Pull requests welcome: an agent is about a dozen lines in
+the `agents` section of `respawn`.
+
+## Terminals
+
+respawn opens the sessions in the terminal you run it from, or the one you name with `--in`.
+
+| Terminal | How the sessions open | Checked |
+| :- | :- | :- |
+| [Warp](https://www.warp.dev) | A window with a tab each, from a launch configuration | **Live** |
+| [tmux](https://github.com/tmux/tmux) | A window each in your session, or a new `respawn` session | **Live**, in CI on macOS and Linux |
+| [iTerm2](https://iterm2.com) | A window with a tab each (AppleScript) | Stub |
+| Terminal.app | A window each: it can't script tabs | Stub |
+| [Ghostty](https://ghostty.org) | A window with a tab each: AppleScript on macOS (1.3+), `+new-tab` on Linux | Stub |
+| [kitty](https://sw.kovidgoyal.net/kitty/) | A window with a tab each, from a session file (no remote control needed) | Stub |
+| [WezTerm](https://wezterm.org) | A window with a tab each (`wezterm cli`) | Stub |
+| [Alacritty](https://alacritty.org) | A window each: it has no tabs | Stub |
+| [Zellij](https://zellij.dev) | A tab each in your session, from a layout | Stub |
+| GNOME Terminal | A window with a tab each | Stub |
+| [Ptyxis](https://gitlab.gnome.org/chergert/ptyxis) | A window with a tab each | Stub |
+| [Konsole](https://konsole.kde.org) | A window with a tab each, from a tabs file | Stub |
+
+Anything else: on a Mac, Terminal.app windows; on Linux, `x-terminal-emulator` windows; in an editor's
+terminal (VS Code, Cursor), the commands printed for you to paste. "Stub" means the tests check exactly what
+respawn sends that terminal, through a stand-in for its command, since a real window can't open in CI.
+
+On macOS, the first time respawn drives iTerm2, Terminal.app or Ghostty, macOS asks whether your terminal may
+control it. Say yes once.
+
 ## How it works
 
-Three [Claude Code hooks](https://code.claude.com/docs/en/hooks) keep a small record of every interactive
-session: its id, its folder, and the `claude` process running it. A record whose process is gone is a
-session that was **cut off**: its terminal went away before you left it.
+Each agent's own hooks keep a small record of every interactive session: its id, its folder, the agent's
+process, and the shell that started it. A session is **cut off** when both the agent and its shell are gone: the
+terminal went away with them.
 
 ```mermaid
 flowchart LR
-    start["claude starts"] -- "SessionStart" --> rec[("record:<br/>session id, folder,<br/>claude process")]
-    prompt["you send a prompt"] -- "UserPromptSubmit" --> rec
-    leave["you /exit, /clear or /resume"] -- "SessionEnd" --> drop["record dropped"]
-    crash["Warp quits, Mac restarts"] --> dead["process gone,<br/>record kept"]
-    dead --> cmd["claude-restore"]
-    cmd -- "warp://launch" --> warp["Warp window:<br/>one tab per session,<br/>claude --resume id"]
+    start["an agent starts a session"] -- "start hook" --> rec[("record:<br/>session id, folder,<br/>agent process, its shell")]
+    prompt["you send a prompt"] -- "prompt hook" --> rec
+    quit["you quit the agent,<br/>the tab stays"] -- "end hook: its shell<br/>is still there" --> drop["record dropped"]
+    crash["the terminal quits,<br/>the Mac restarts"] --> gone["agent and shell gone,<br/>record kept"]
+    gone --> cmd["respawn"]
+    cmd -- "a tab per session" --> tabs["your terminal:<br/>each session resumed<br/>by id, in its folder"]
 ```
 
-How a session ended decides whether it comes back:
+The hard part is telling a quit from a closed terminal. Most agents can't: Codex ends every session with the
+same reason, and Gemini CLI, Qwen Code and Crush send the same one whether you typed `/quit` or the window
+closed. So respawn asks the process tree instead. When a session ends, an agent you quit is still the child of
+its shell; an agent whose terminal closed has already lost it. That was measured, not assumed: with a real
+Claude Code in a real shell, a closed terminal left the agent reparented before its end hook ran, in every run,
+and `/exit` never did.
 
-| The session ended because | claude-restore |
+| The session ended because | respawn |
 | :- | :- |
-| Warp quit, the Mac restarted, the window closed, the terminal crashed | Offers it |
-| You left it with `/exit` (or quit at the prompt) | Forgets it |
-| You switched away with `/clear` or `/resume` | Forgets it, and records the session you switched to |
-| It was a `claude -p` run, an SDK run or a background session | Never records it (none of those has a terminal) |
-| It was a subagent or a teammate | Never records it |
+| The terminal quit, the Mac restarted, the window or tab closed, the terminal crashed | Offers it |
+| You quit the agent and kept using the tab | Forgets it |
+| You switched with `/clear` or `/resume` | Forgets it, and records the session you switched to |
+| The agent unloaded it while idle (Codex does, after 30 minutes) | Keeps it: it's still open |
+| A headless run (`claude -p`, `codex exec`) or a background session | Never records it: no terminal |
+| A subagent or a teammate | Never records it |
 | It was cut off more than 7 days ago | Drops it |
 
-A few details make this reliable:
+A few more details:
 
-- **"Gone" means gone.** A record stores the process id *and* its start time. After a reboot, process ids get
-  reused, so a pid alone could make a dead session look alive.
-- **Nothing to resume, nothing offered.** A session that was opened and closed without a single message
-  has no transcript, and is dropped.
-- **Folders that moved.** If a session's folder no longer exists (a removed git worktree, say), its tab
-  opens in your home folder and `claude --resume` finds the session by id anyway.
-- **Each entry shows the first real prompt** (the first one that is not a slash command), so you see what
-  the session was about rather than its last "go on".
-- **Cheap.** The per-prompt hook takes about 20 ms, and returns at once for a session it has already
-  recorded.
+- **"Gone" means gone.** A record keeps each process's start time as well as its id: after a reboot, ids are
+  reused, and a dead shell's zombie still answers `kill -0`.
+- **Codex runs its hooks in a background daemon**, away from your window. respawn finds the window by its folder
+  and its terminal instead.
+- **A hook belongs to its nearest agent.** Copilot CLI and Cursor CLI also run Claude Code's hooks; respawn
+  doesn't mistake their sessions for Claude's.
+- **Folders that moved.** If a session's folder is gone (a removed worktree, say), its tab opens in your home
+  folder, and the agent finds the session by id.
+- **Cheap.** The prompt hook returns at once for a session it has already recorded.
 
 ### What it touches
 
-Everything stays on your machine. Nothing goes over the network.
+Everything stays on your machine; respawn makes no network calls.
 
 | Path | Why |
 | :- | :- |
-| `~/.claude/session-restore/open/<session-id>.json` | One record per open session (written by the hooks) |
-| `~/.claude/history.jsonl` | Read, to show each session's first prompt |
-| `~/.claude/settings.json` | The three hooks (written by the installer only) |
-| `~/.warp/launch_configurations/claude-restore.yaml` | The window `claude-restore` opens |
+| `~/.local/state/respawn/sessions/` | One small JSON record per open session, written by the hooks |
+| Each agent's own hooks file | The hooks, written by `respawn setup`, removed by `respawn uninstall` |
+| `~/.claude/history.jsonl` | Read, for a Claude Code session's first prompt when the hooks didn't see it |
+| `~/.local/state/respawn/` | The files kitty, Konsole and Zellij open the tabs from |
+| `~/.warp/launch_configurations/respawn.yaml` | The window Warp opens |
 
 ## FAQ
 
-**Why not tmux and tmux-resurrect?**
-That works, but Warp's own features (blocks, its input editor) don't work inside tmux. claude-restore keeps
-you in plain Warp tabs.
+**I closed one tab on purpose, and now it's offered.**
+Closing a tab ends a session the same way a crash does, so nothing can tell the two apart. Reopen only the
+ones you want (`1 3`), or run `respawn --clear`.
 
-**Does it work with iTerm2, Ghostty or Terminal.app?**
-Recording works in any terminal. Reopening the tabs is Warp-only today, through Warp's
-[launch configurations](https://docs.warp.dev/terminal/sessions/launch-configurations). In another terminal,
-`claude-restore --dry-run` prints the session ids to resume. Pull requests for other terminals are welcome.
+**Why not tmux and tmux-resurrect?** That works, if you live in tmux. respawn works in whatever terminal you
+already use, tmux included.
 
-**What about Claude Code's background sessions (`claude agents`)?**
-They keep running when Warp quits, and after a restart they are listed in `claude agents`, so they don't
-need this. claude-restore covers the sessions you run in your tabs.
+**What about Claude Code's background sessions (`claude agents`)?** They survive a closed terminal on their
+own, and are listed in `claude agents` after a restart. respawn covers the sessions in your tabs.
 
-**I closed one tab on purpose, and now it is offered.**
-Closing a tab ends a session the same way a crash does, so the hooks can't tell the two apart. Reopen only
-the ones you want (`1 3`), or run `claude-restore --clear`.
-
-**Linux?**
-The hooks are portable. Reopening is macOS-only for now (`open`, and Warp's macOS paths); `--list` and
-`--dry-run` work anywhere.
+**Linux?** Yes: the hooks, the records, tmux, and the Linux terminals above. CI runs the whole suite on Ubuntu.
 
 ## Uninstall
 
 ```bash
-./install.sh --uninstall
+respawn uninstall && rm ~/.local/bin/respawn
 ```
 
-This removes the script, its three hooks (and nothing else from your settings) and its records.
+Or `./install.sh --uninstall` from a clone. Either removes respawn's hooks from every agent, and nothing else.
 
 ## Development
 
 ```bash
-tests/test.sh                                          # 35 tests, each against a throwaway HOME
-shellcheck -x claude-restore install.sh tests/test.sh
+tests/test.sh                                      # 100+ tests, each against a throwaway HOME
+shellcheck -x respawn install.sh tests/test.sh
 ```
 
-The tests run each hook the way Claude Code does: as a child of a stand-in `claude` process that has its own
-pseudo-terminal (`tests/fake_claude.c`, `tests/in_terminal.py`).
+The tests give every agent a realistic life: a pseudo-terminal, a shell in it, a stand-in for the agent under the
+shell (`tests/fake_agent.c`), and the agent's hooks run by it, including a terminal that closes mid-session
+(`tests/in_terminal.py`). Each terminal is driven through a stub that records what respawn sent it, and tmux
+for real. CI runs it all on macOS and Ubuntu.
 
 ## License
 
-[MIT](LICENSE). Not affiliated with Anthropic or Warp.
+[MIT](LICENSE). Not affiliated with the makers of any agent or terminal it supports.

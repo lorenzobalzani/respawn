@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1013" height="287" viewBox="0 0 1013 287" role="img" aria-label="respawn listing five cut-off sessions from Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor CLI, then reopening them in Warp">
+  <rect x="0.5" y="0.5" width="1012" height="286" rx="12" fill="#161b22" stroke="#30363d"/>
+  <circle cx="22" cy="20" r="6" fill="#ff5f57"/><circle cx="42" cy="20" r="6" fill="#febc2e"/><circle cx="62" cy="20" r="6" fill="#28c840"/>
+  <text x="506.5" y="25" fill="#7d8590" font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" text-anchor="middle">after a restart</text>
+  <line x1="0" y1="38" x2="1013" y2="38" stroke="#30363d"/>
+  <g font-family="ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14">
+  <clipPath id="typed"><rect x="42.86" y="42" height="22" width="0"><animate attributeName="width" values="0.0;8.4;16.9;25.3;33.7;42.1;50.6;59.0" begin="0.4s" dur="0.8s" calcMode="discrete" fill="freeze"/></rect></clipPath>
+  <text x="26" y="58"><tspan fill="#3fb950" font-weight="600">$ </tspan></text>
+  <text x="42.86" y="58" fill="#e6edf3" clip-path="url(#typed)">respawn</text>
+  <text x="26" y="81" fill="#e6edf3" opacity="0">5 agent sessions were cut off:<set attributeName="opacity" to="1" begin="1.5s" fill="freeze"/></text>
+  <text x="26" y="104" opacity="0" xml:space="preserve"><tspan fill="#7d8590">   1. </tspan><tspan fill="#e08a6d" font-weight="600">claude  </tspan><tspan fill="#e6edf3"> ~/code/api                   </tspan><tspan fill="#7d8590">  2m ago  </tspan><tspan fill="#e6edf3">migrate the billing tables to the new schema</tspan><set attributeName="opacity" to="1" begin="1.66s" fill="freeze"/></text>
+  <text x="26" y="127" opacity="0" xml:space="preserve"><tspan fill="#7d8590">   2. </tspan><tspan fill="#3ccf9b" font-weight="600">codex   </tspan><tspan fill="#e6edf3"> ~/code/web                   </tspan><tspan fill="#7d8590">  2m ago  </tspan><tspan fill="#e6edf3">fix the flaky checkout end-to-end test</tspan><set attributeName="opacity" to="1" begin="1.8199999999999998s" fill="freeze"/></text>
+  <text x="26" y="150" opacity="0" xml:space="preserve"><tspan fill="#7d8590">   3. </tspan><tspan fill="#6aa5ff" font-weight="600">gemini  </tspan><tspan fill="#e6edf3"> ~/code/infra                 </tspan><tspan fill="#7d8590">  3m ago  </tspan><tspan fill="#e6edf3">why does the deploy hang on the migration step?</tspan><set attributeName="opacity" to="1" begin="1.9799999999999998s" fill="freeze"/></text>
+  <text x="26" y="173" opacity="0" xml:space="preserve"><tspan fill="#7d8590">   4. </tspan><tspan fill="#c69cff" font-weight="600">copilot </tspan><tspan fill="#e6edf3"> ~/code/mobile                </tspan><tspan fill="#7d8590"> 41m ago  </tspan><tspan fill="#e6edf3">add offline mode to the sync screen</tspan><set attributeName="opacity" to="1" begin="2.1399999999999997s" fill="freeze"/></text>
+  <text x="26" y="196" opacity="0" xml:space="preserve"><tspan fill="#7d8590">   5. </tspan><tspan fill="#f0f3f6" font-weight="600">cursor  </tspan><tspan fill="#e6edf3"> ~/code/docs                  </tspan><tspan fill="#7d8590">  1h ago  </tspan><tspan fill="#e6edf3">rewrite the onboarding guide for v2</tspan><set attributeName="opacity" to="1" begin="2.3s" fill="freeze"/></text>
+  <text x="26" y="219" fill="#e6edf3" opacity="0" xml:space="preserve">Reopen them in Warp? [Y/n, or numbers like "1 3"] <set attributeName="opacity" to="1" begin="2.8s" fill="freeze"/></text>
+  <text x="447.5" y="219" fill="#e6edf3" opacity="0">y<set attributeName="opacity" to="1" begin="3.6999999999999997s" fill="freeze"/></text>
+  <text x="26" y="242" opacity="0"><tspan fill="#3fb950" font-weight="600">Reopened 5 sessions in Warp.</tspan><set attributeName="opacity" to="1" begin="4.199999999999999s" fill="freeze"/></text>
+  </g>
+</svg>
