@@ -770,6 +770,103 @@ legacy_settings
 "$BIN" uninstall >/dev/null
 check "uninstall takes them out too" jq -e '.hooks | keys == ["Stop"]' "$HOME/.claude/settings.json"
 
+echo "setup: sessions already open"
+fresh_home
+mkdir -p "$HOME/.claude/sessions"
+# A Claude Code window open since before respawn was installed: a stand-in in a terminal, under its shell, that
+# writes the file Claude Code keeps for each of its processes, ~/.claude/sessions/<pid>.json, and runs no hook.
+# It stays until the test is done, running what the test hands it (run.<id>), the way Claude Code runs a hook.
+cat >"$WORK/window.sh" <<'EOF'
+work=${0%/*} id=$1 dir=$HOME/.claude/sessions
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","startedAt":%s,"procStart":"%s","version":"2.1.317","kind":"%s","entrypoint":"%s","status":"idle"}\n' \
+  "$PPID" "$id" "$2" "${5:-$(date +%s)000}" "$(TZ=UTC LC_ALL=C ps -o lstart= -p "$PPID")" "$3" "$4" >"$dir/.$PPID" &&
+  mv "$dir/.$PPID" "$dir/$PPID.json"
+n=0
+while [ ! -e "$work/done" ] && [ "$n" -lt 400 ]; do
+  if [ -f "$work/run.$id" ]; then
+    sh "$work/run.$id"
+    rm -f "$work/run.$id"
+    touch "$work/ran.$id"
+  fi
+  sleep 0.1
+  n=$((n + 1))
+done
+EOF
+window_line() { printf 'exec /bin/sh %s %s %s %s %s %s' "$(quote "$WORK/window.sh")" "$1" "$(quote "$2")" "${3:-interactive}" "${4:-cli}" "${5:-}"; }
+window() { (session "$FAKES/$1" "$(window_line "${@:2}")") & } # stand-in id cwd [kind [entrypoint [written-ms]]]
+window claude open-1 /work/api
+transcript open-1
+claude_history open-1 "/model opus"
+claude_history open-1 "tidy the deploy
+  scripts"
+claude_history open-1 "go on"
+window claude open-2 /work/web
+transcript open-2
+window claude kept /work/kept
+transcript kept
+fake_record claude kept /work/kept
+jq '.first_prompt = "keep me"' "$STATE/claude.kept.json" >"$WORK/r" && mv "$WORK/r" "$STATE/claude.kept.json"
+cp "$STATE/claude.kept.json" "$WORK/kept.before"
+window claude reused /work/reused interactive cli "$((($(date +%s) - 86400) * 1000))" # its file is from a day ago
+transcript reused
+window claude bg /work/bg bg
+transcript bg
+window claude sdk /work/sdk interactive sdk-ts
+transcript sdk
+window codex not-claude /work/codex # some other program, under the pid a Claude Code file names
+transcript not-claude
+# no terminal: a session of its own, which a fork leaves without one
+python3 -c 'import os, sys
+if os.fork() == 0:
+    os.setsid()
+    os.execv(sys.argv[1], sys.argv[1:])
+os.wait()' "$FAKES/claude" "$(window_line no-tty /work/no-tty)" </dev/null >/dev/null 2>&1 &
+transcript no-tty
+window claude no-transcript /work/fresh # opened, never sent a message
+sh -c 'exit 0' &
+dead=$!
+wait "$dead"
+printf '{"pid":%s,"sessionId":"dead","cwd":"/work/dead","startedAt":%s000,"kind":"interactive","entrypoint":"cli"}\n' \
+  "$dead" "$(date +%s)" >"$HOME/.claude/sessions/$dead.json"
+transcript dead
+eventually bash -c "[ \$(ls '$HOME/.claude/sessions' | grep -c '^[0-9]*\.json\$') -ge 10 ]"
+doctor_out=$("$BIN" doctor)
+out=$("$BIN" setup)
+adopted="$STATE/claude.open-1.json"
+open_pid=$(grep -l '"sessionId":"open-1"' "$HOME/.claude/sessions"/*.json 2>/dev/null | sed 's|.*/||; s|\.json$||')
+check "doctor counts the open sessions that have no record" has "$doctor_out" "2 open sessions not recorded yet: run respawn setup"
+check "setup records the Claude Code sessions already open" bash -c "[ -e '$adopted' ] && [ -e '$STATE/claude.open-2.json' ]"
+check "  and says how many" has "$out" "Recorded 2 sessions already open."
+check "  each against its process, with its folder and its transcript" jq -e --argjson pid "${open_pid:-0}" --arg t "$HOME/.claude/projects/p/open-1.jsonl" \
+  '.agent == "claude" and .session_id == "open-1" and .cwd == "/work/api" and .pid == $pid and .transcript == $t' "$adopted"
+check "  its shell, the tab's, the session leader above it" \
+  bash -c "[ \"\$(jq .shell_pid '$adopted')\" = \"\$(ps -o ppid= -p '${open_pid:-0}' | tr -d ' ')\" ]"
+check "  and the first prompt in Claude Code's history that is not a slash command" jq -e '.first_prompt == "tidy the deploy scripts"' "$adopted"
+adopted_not() { exists "$adopted" && missing "$STATE/claude.$1.json"; } # setup ran, and left this one out
+check "a session that has a record keeps it as it was" bash -c "[ -e '$adopted' ] && cmp -s '$WORK/kept.before' '$STATE/claude.kept.json'"
+check "a file whose process is gone is passed over" adopted_not dead
+check "  and one whose pid another process has taken since" adopted_not reused
+check "a background session is not recorded" adopted_not bg
+check "  nor the SDK's" adopted_not sdk
+check "  nor a process that is not Claude Code's" adopted_not not-claude
+check "  nor one with no terminal" adopted_not no-tty
+check "  nor one with no transcript yet, which has nothing to resume" adopted_not no-transcript
+snapshot() { for file in "$STATE"/*.json; do printf '%s ' "$file"; cat "$file"; done; }
+before=$(snapshot)
+again=$("$BIN" setup)
+check "setting up again records nothing twice and changes no record" \
+  bash -c "[ -e '$adopted' ] && ! grep -q Recorded <<<\"\$1\" && [ \"\$2\" = \"\$3\" ]" _ "$again" "$before" "$(snapshot)"
+check "  and doctor has nothing left to count" bash -c "[ -e '$adopted' ] && ! '$BIN' doctor | grep -q 'not recorded'"
+# The window now runs its start hook, as a session started after the install does: the record must not change.
+cp "$adopted" "$WORK/adopted"
+payload="{\"session_id\":\"open-1\",\"cwd\":\"/work/api\",\"transcript_path\":\"$HOME/.claude/projects/p/open-1.jsonl\"}"
+hook_line claude start "$payload" >"$WORK/run.open-1"
+eventually exists "$WORK/ran.open-1"
+check "the record setup writes is the one the start hook writes, field for field" \
+  bash -c "[ \"\$(jq -S 'del(.recorded_at)' '$WORK/adopted')\" = \"\$(jq -S 'del(.recorded_at)' '$adopted')\" ]"
+touch "$WORK/done"
+wait
+
 echo "installer"
 fresh_home
 mkdir -p "$HOME/.claude"

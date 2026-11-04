@@ -36,8 +36,9 @@ Or from a clone: `git clone https://github.com/lorenzobalzani/respawn.git && cd 
 The installer puts `respawn` in `~/.local/bin` and adds its hooks to every supported agent it finds. It
 changes nothing else in their settings, keeps a backup of every file it edits, writes a settings file that is a
 symlink (stow, chezmoi) where the link points, leaves alone a file that isn't valid JSON, and adds nothing when
-run again. Sessions you start from then on are recorded; ones already open are recorded on their next prompt, so
-there is nothing to restart. Install an agent later? Run `respawn setup`.
+run again. Sessions you start from then on are recorded, and so are the Claude Code sessions already open, which
+Claude Code lists on disk. Other agents keep no such list, so their open sessions are recorded on their next
+prompt. Either way there is nothing to restart. Install an agent later? Run `respawn setup`.
 
 **Upgrading from claude-restore 0.1.0?** The installer takes its hooks out of Claude Code's settings, and tells you
 where its script and its records are, so that you can delete them.
@@ -55,8 +56,8 @@ where its script and its records are, so that you can delete them.
 | `respawn --dry-run` | Print the commands instead of opening anything |
 | `respawn --in kitty` | Open them in another terminal than the one you're in (with any of the above: `respawn -y --in kitty`) |
 | `respawn --clear` | Forget the cut-off sessions (each agent still has them in its own resume list) |
-| `respawn setup` | Add the hooks to every supported agent installed here |
-| `respawn doctor` | Show the agents respawn sees, their hooks, your terminal, its records |
+| `respawn setup` | Add the hooks to every supported agent installed here, and record the Claude Code sessions already open |
+| `respawn doctor` | Show the agents respawn sees, their hooks, your terminal, its records, and any open session it has no record of |
 | `respawn uninstall` | Remove the hooks and the records |
 
 When it asks, type `1 3` to reopen only some of them. If the terminal fails to open them (no display, not
@@ -161,6 +162,12 @@ A few more details:
 - **"Gone" means gone.** A record keeps each process's start time as well as its id: after a reboot, ids are
   reused, and a dead shell's zombie still answers `kill -0`. On Linux the start time is counted from boot, as the
   kernel keeps it, so a clock that NTP steps doesn't make a running session look dead.
+- **Sessions open before the install.** The hooks record a session as it starts or at its next prompt, so one
+  already open when you install respawn has no record yet. Claude Code keeps a file for each of its processes,
+  naming the session it runs (`~/.claude/sessions/<pid>.json`), so `respawn setup` records those sessions at once,
+  as their start hook would have: the interactive ones in a terminal, whose process is still the one that wrote
+  the file, that have a transcript to resume. No other agent keeps such a list, so theirs are recorded on their
+  next prompt. `respawn doctor` counts any open session it can see that has no record yet.
 - **The tab's shell, not whatever started the agent.** A launcher between the shell and the agent (npm's `node`
   for Codex or OpenCode, `npx`, `caffeinate`, `mise exec`) exits with the agent, so respawn records the session
   leader above the agent, which is the shell the terminal started.
@@ -190,6 +197,7 @@ Everything stays on your machine; respawn makes no network calls.
 | `~/.local/state/respawn/sessions/` | One small JSON record per open session, written by the hooks |
 | Each agent's own hooks file | The hooks, written by `respawn setup`, removed by `respawn uninstall` |
 | `~/.claude/history.jsonl` | Read, for a Claude Code session's first prompt when the hooks didn't see it |
+| `~/.claude/sessions/` | Read, by `respawn setup` and `respawn doctor`, for the Claude Code sessions already open |
 | `~/.local/state/respawn/` | The files kitty, Konsole and Zellij open the tabs from |
 | `~/.warp/launch_configurations/respawn.yaml` (macOS), `~/.local/share/warp-terminal/launch_configurations/respawn.yaml` (Linux) | The window Warp opens |
 

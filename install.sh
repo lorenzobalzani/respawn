@@ -44,7 +44,8 @@ install() {
     *) echo "Note: $BIN_DIR is not on your PATH. Add it, or run $BIN directly." ;;
   esac
   echo
-  echo "Done. Sessions you start from now on are recorded; ones already open are recorded on their next prompt."
+  echo "Done. Every session you start from now on is recorded, and Claude Code's open ones already are."
+  echo "Other agents' open sessions are recorded on their next prompt."
   echo "After your terminal quits or the machine restarts, run: respawn"
 }
 
